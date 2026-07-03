@@ -1,0 +1,166 @@
+ALEKH2D — FLOW: HYBRID CV + OCR + VLM (CONFIDENCE-ROUTED EXTRACTION)
+========================================================================
+
+GOAL
+----
+Combine cheap, local, deterministic detection (CV + OCR) with
+expensive, semantic reasoning (VLM) so that:
+  - Easy/known regions are extracted for free, with high accuracy.
+  - Ambiguous regions get the VLM's reasoning, but primed with a
+    hint instead of reading raw pixels blind.
+  - Only genuinely hard regions burn full "cold" VLM cost.
+This is the most accurate AND the most cost-efficient of the three
+approaches (vs. adaptive-CV-only, vs. uniform sliding window).
+
+
+STEP 1 — RENDER MASTER IMAGE
+-----------------------------
+- pypdfium2 renders each PDF page at high DPI (scale=3.0-4.0) into a
+  master image, server-side, inside the FastAPI service (same as the
+  other two flows). This is the coordinate reference frame for every
+  crop and every bbox.
+
+
+STEP 2 — TITLE BLOCK EXTRACTION (local OCR, no LLM)
+-------------------------------------------------------
+- Fixed-% crop (or Tesseract-label-matched crop) of the bottom-right
+  region at full native resolution.
+- Run Tesseract OCR directly on the crop to pull structured fields:
+  DRG.No., REV, DATE, MATERIAL, SCALE, SHEET NO., DEPARTMENT,
+  EQUIP/AREA, DETAIL, DRN/CHD/APP.
+- These are clean printed fields on a fixed template — no LLM call
+  needed in the common case. Only escalate to the LLM if OCR
+  confidence is low (e.g. below a threshold) or fields look
+  handwritten/stamped.
+- Cost: $0 in the common case.
+
+
+STEP 3 — CV STRUCTURAL DETECTION (local, no LLM)
+-----------------------------------------------------
+- Grayscale + Otsu threshold the master image.
+- Morphological dilation merges nearby ink into connected blobs
+  (so a label + its leader line + its symbol become one region
+  instead of scattered fragments).
+- cv2.findContours (or MSER) extracts candidate bounding boxes for
+  all connected ink regions, excluding the already-handled title
+  block and page-border-sized contours.
+- Merge adjacent/overlapping contours into unified regions so you
+  don't get hundreds of tiny fragments.
+- Output: list of candidate region bboxes in master-image coords.
+
+
+STEP 4 — OCR-BASED CLASSIFICATION HINT (local, no LLM)
+------------------------------------------------------------
+- For each candidate region from Step 3, run Tesseract OCR on the
+  crop to extract any text present.
+- Classify each region into one of three confidence buckets by
+  comparing OCR text against known patterns:
+
+  (a) HIGH CONFIDENCE — LEGEND MATCH
+      - OCR text exactly matches an entry already extracted from the
+        drawing's own "LEGEND FOR CONVEYORS" block (e.g. "T.T.I.",
+        "IMP.I", "V.R.") AND is positioned near the matching symbol.
+      - Action: skip the VLM entirely. Populate the row directly:
+        Category = "component", Component_Name = legend definition,
+        Extraction_Method = "ocr_legend_match".
+
+  (b) MEDIUM CONFIDENCE — LABELED BUT UNMATCHED
+      - OCR text found (e.g. "TRUCK DUMP HOPPER", "MONORAIL",
+        "WALKWAY") but does not match the legend vocabulary.
+      - Action: send region to VLM WITH the OCR text as a hint in
+        the prompt (e.g. "OCR detected the text 'MONORAIL' in this
+        crop, near a drawn symbol — classify and extract").
+        Extraction_Method = "vlm_with_hint".
+
+  (c) LOW CONFIDENCE — NO CLEAR TEXT / DENSE LINE-WORK
+      - OCR found little or no usable text (e.g. dense structural
+        cross-hatching, unlabeled connection detail).
+      - Action: send region to VLM cold, no hint, let vision
+        reasoning alone interpret it.
+        Extraction_Method = "vlm_cold".
+
+- Also apply the same text-pattern check to filter out non-component
+  noise before it ever reaches the VLM:
+      - Pure dimension strings / numbers on leader lines (e.g. "3100",
+        "2010") -> tag as Category = "dimension" candidate, not
+        "component" -- still passed to VLM in Step 5 for full
+        dimension-schema extraction (Tolerance, Dim_Type, etc.),
+        just classified up front so the VLM prompt can say which
+        rows to treat as dimensions vs. components.
+      - Pure coordinate/elevation markers (E-xxxx, N-xxxx, EL, B.O.B.C)
+        -> can often be parsed directly via regex on the OCR text,
+        no VLM needed at all for these.
+
+
+STEP 5 — BATCH VLM CALL (only medium + low confidence regions)
+----------------------------------------------------------------------
+- Build one prompt_content list per page/session (same call_llm
+  pattern already in extract_data):
+    - system_instruction (unified schema, includes Category,
+      Component_Name, Extraction_Method fields)
+    - title block crop (only if OCR confidence was low in Step 2)
+    - each MEDIUM confidence crop, with its OCR hint text included
+      as an accompanying text block before the image
+    - each LOW confidence crop, sent without a hint
+    - full master page is NOT sent at high detail (per cost flow
+      discussed earlier) -- optionally sent at "low" detail only if
+      a coarse full-page pass adds value
+- One LLM call per page covers all medium/low regions -- no separate
+  round trips per region.
+
+
+STEP 6 — MERGE ALL THREE SOURCES
+--------------------------------------
+- Combine into one unified result array:
+    1. OCR-legend-matched rows from Step 4a (no VLM cost)
+    2. Regex-parsed coordinate/elevation rows from Step 4 (no VLM cost)
+    3. VLM-extracted rows from Step 5 (hint-assisted + cold)
+    4. Title block fields from Step 2
+- Convert every region's local bbox back into master-image
+  coordinates (add crop x/y offset) for canvas rendering.
+- Dedupe any overlap-zone duplicates via bbox IoU or fuzzy text match
+  on Dim_Description / Component_Name, same as other flows.
+- Feed into existing extract_json_array parsing (for the VLM portion),
+  BigQuery logging, Excel export, and Fabric.js canvas -- no changes
+  needed to that downstream code, since the final array shape is the
+  same regardless of which extraction method produced each row.
+
+
+COST PROFILE
+-------------
+- Cheapest of all approaches discussed so far:
+    - Title block: usually $0 (OCR only)
+    - Legend-matched components: $0 (OCR + lookup only)
+    - Coordinate/elevation markers: $0 (regex only)
+    - Only medium/low confidence regions cost VLM tokens, and even
+      those get a head start via the OCR hint (may reduce required
+      reasoning/tokens vs. cold extraction)
+- Also the most accurate: legend-matched and regex-parsed rows are
+  deterministically correct (no hallucination risk at all), and
+  hint-assisted VLM calls tend to be more reliable than cold reads
+  on cluttered technical drawings.
+
+
+ACCURACY / AUDIT BENEFIT
+----------------------------
+- The Extraction_Method field on every row lets you audit results
+  after the fact:
+    - "ocr_legend_match" / regex rows -> trust fully, skip review
+    - "vlm_with_hint" rows -> spot-check occasionally
+    - "vlm_cold" rows -> prioritize for human QA review first, since
+      these are the rows most likely to need correction
+- This maps naturally onto the existing /api/feedback endpoint --
+  feedback collected on vlm_cold rows is the most valuable signal for
+  improving the prompt or legend vocabulary over time.
+
+
+DEPENDENCIES NEEDED
+---------------------
+- pypdfium2 (already in use) -- page rendering
+- opencv-python (new) -- contour detection, morphological ops
+- pytesseract (already a dependency from the Tata Steel indent
+  project) -- OCR for title block, region classification hints,
+  and coordinate/elevation regex parsing
+- PIL/Pillow (already in use) -- cropping, compositing
+- re / regex (standard library, already imported as `re` in
+  agent_app_6.py) -- coordinate/elevation marker parsing
