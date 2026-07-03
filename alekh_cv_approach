@@ -1,0 +1,114 @@
+ALEKH2D — FLOW: CV-BASED ADAPTIVE REGION CROPPING
+====================================================
+
+GOAL
+----
+Only send the LLM images of areas that actually contain content
+(components, dimensions, title block). Skip blank space entirely.
+This is the lowest token-cost option since no wasted tiles are sent.
+
+
+STEP 1 — RENDER MASTER IMAGE
+-----------------------------
+- Input: user-uploaded PDF (single or multi-page GA/assembly drawing).
+- Use pypdfium2 to render each page at high DPI (e.g. scale=3.0-4.0).
+- This becomes the "master image" — the coordinate reference frame
+  for every crop and every bbox returned later.
+- Keep this master image in memory; do NOT send it to the LLM directly
+  at high detail (too expensive, too low-res for small labels anyway).
+
+
+STEP 2 — TITLE BLOCK REGION (fixed or detected)
+-------------------------------------------------
+- Title blocks sit in a predictable spot on Tata Steel templates
+  (bottom-right corner).
+- Option A (fast): fixed-percentage crop, e.g. bottom-right 30% width
+  x 20% height, cropped from the master image at full resolution.
+- Option B (robust): use Tesseract OCR to search the page for known
+  label strings ("DRG.No.", "REV", "TATA STEEL", "SHEET NO.") and use
+  their bounding boxes to locate and crop the title block region.
+- Once cropped, either:
+    (a) run local OCR (Tesseract) directly on the crop and skip the
+        LLM entirely for structured fields like DRG.No, REV, DATE,
+        MATERIAL, SCALE, SHEET NO — these are clean printed text and
+        don't need vision reasoning.
+    (b) OR send the small crop to the LLM only if OCR confidence is
+        low or fields are handwritten/stamped.
+- This step costs $0 in the common case (OCR-only).
+
+
+STEP 3 — CV-BASED CONTENT REGION DETECTION
+---------------------------------------------
+- Convert master image to grayscale, apply Otsu thresholding to binarize.
+- Apply morphological dilation (small kernel) to merge nearby ink
+  (individual characters/lines) into connected blobs — this turns
+  "TRUCK DUMP HOPPER" from scattered letters into one connected region.
+- Run cv2.findContours (or MSER) on the dilated binary image to get a
+  list of bounding boxes for all connected ink regions.
+- Filter out:
+    - Very small contours (noise, dots, stray marks)
+    - The already-handled title block region (step 2)
+    - Very large contours that just outline the whole page border
+- Optionally merge overlapping/adjacent contours into larger unified
+  regions (e.g. group anything within N pixels of each other) so you
+  don't end up with hundreds of tiny separate crops.
+- Output: a list of candidate region bounding boxes in master-image
+  coordinates — e.g. [elevation view, plan view, key plan, legend,
+  hopper detail cluster, pulley detail cluster, ...].
+
+
+STEP 4 — CROP + (OPTIONAL) COMPOSITE
+---------------------------------------
+- For each candidate region: crop from the master image with small
+  padding (10-20px) so nothing gets clipped at the edge.
+- If a region is still very large/dense (e.g. the whole elevation
+  view spans thousands of pixels), optionally sub-tile only that
+  region using a small internal sliding window (bounded, not
+  page-wide) — this is the only place tiling logic is used, and only
+  when truly necessary.
+- Cost-saving option: instead of sending each region crop as a
+  separate image, stitch multiple smaller crops into a single
+  labeled composite image (grid layout, clear borders, cell labels)
+  using PIL. One well-labeled composite costs less than N separate
+  images.
+
+
+STEP 5 — SINGLE LLM CALL PER PAGE
+------------------------------------
+- Build one prompt_content list (as already done in extract_data):
+    - system_instruction (unified schema: dimension rows AND
+      component rows, per Category field)
+    - title block crop image (only if OCR was low-confidence)
+    - each region crop / composite image, "detail": "high"
+    - do NOT include the full master image at high detail
+- Send everything in one call_llm() invocation — no extra round trips.
+
+
+STEP 6 — MERGE, DEDUPE, NORMALIZE
+------------------------------------
+- Parse LLM response via extract_json_array (already exists).
+- If overlap padding caused any duplicate detections across adjacent
+  region crops, dedupe by fuzzy text match on Dim_Description /
+  Component_Name, or by bbox proximity once bboxes are converted back
+  to master-image coordinates (add crop offset to each local bbox).
+- Feed into existing BigQuery logging, Excel export, and Fabric.js
+  canvas rendering — no changes needed downstream.
+
+
+COST PROFILE
+-------------
+- Cheapest of all approaches (adaptive crops, sliding window,
+  single full-page image).
+- No wasted tokens on blank space.
+- No overlap waste (only pads regions slightly, doesn't duplicate
+  whole tiles).
+- Title block often costs $0 (OCR only, no LLM).
+
+
+DEPENDENCIES NEEDED
+---------------------
+- pypdfium2 (already in use) — page rendering
+- opencv-python (new) — contour detection, morphological ops
+- pytesseract (already a dependency from the Tata Steel indent
+  project) — title block OCR, optional label-based region detection
+- PIL/Pillow (already in use) — cropping, compositing
