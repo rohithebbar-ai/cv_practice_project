@@ -1,0 +1,119 @@
+ALEKH2D — FLOW: UNIFORM SLIDING WINDOW TILING
+=================================================
+
+GOAL
+----
+Guarantee full page coverage by mechanically tiling the entire page
+into overlapping crops, without relying on any content-detection
+step. Simpler to implement, but more expensive in LLM tokens since
+blank/low-content tiles are still sent and paid for.
+
+
+STEP 1 — RENDER MASTER IMAGE
+-----------------------------
+- Same as adaptive approach: use pypdfium2 to render each PDF page at
+  high DPI (e.g. scale=3.0-4.0) into a master image.
+- This is the coordinate reference frame for all tile offsets and
+  for mapping results back to global bboxes.
+
+
+STEP 2 — TITLE BLOCK REGION (fixed crop)
+-------------------------------------------
+- Same as adaptive approach: fixed-percentage crop of bottom-right
+  region (or Tesseract-OCR-detected), extracted separately from the
+  tiling grid so it isn't redundantly covered by tiles.
+- Prefer local OCR (Tesseract) over LLM call for structured fields
+  where possible, to save cost.
+
+
+STEP 3 — DEFINE TILE GRID
+----------------------------
+- Decide a tile size the LLM can read clearly, e.g. 1500-2000px per
+  side (test against your drawings' actual label/font size).
+- Decide overlap percentage, e.g. 15-20%, so that labels or dimension
+  strings straddling a tile boundary aren't cut off mid-word.
+- Compute:
+    tile_stride = tile_size * (1 - overlap_percent)
+    num_cols = ceil((master_width  - tile_size) / tile_stride) + 1
+    num_rows = ceil((master_height - tile_size) / tile_stride) + 1
+- This produces a full grid of (row, col) tile positions covering the
+  entire master image, edge-to-edge, with no gaps.
+
+
+STEP 4 — CROP EACH TILE
+---------------------------
+- For each (row, col) position:
+    - Compute x_offset = col * tile_stride
+    - Compute y_offset = row * tile_stride
+    - Crop [x_offset, y_offset, x_offset+tile_size, y_offset+tile_size]
+      from the master image, clamping at image edges for the last
+      row/column.
+    - Store (x_offset, y_offset) alongside the crop — needed later to
+      convert any detection's local bbox back into master-image
+      coordinates.
+- Result: a full list of tile images covering 100% of the page, with
+  overlapping edges between neighbors.
+
+
+STEP 5 — SEND TILES TO LLM
+------------------------------
+- Two sub-options:
+    (a) One LLM call per tile (simplest, most calls, easiest to debug
+        per-tile failures, but highest total request overhead).
+    (b) Batch multiple tiles into a single call_llm() invocation as
+        multiple images in one prompt_content list (fewer round
+        trips, but a single larger token bill per call — same total
+        image cost either way, just fewer HTTP calls).
+- Prompt asks for the same unified schema (dimension rows + component
+  rows via Category field) used elsewhere in the pipeline.
+- Every tile gets processed even if it's mostly blank space or just a
+  gridline/dimension string — this is the core cost inefficiency of
+  this approach.
+
+
+STEP 6 — MERGE, DEDUPE, NORMALIZE
+------------------------------------
+- Parse each tile's response via extract_json_array.
+- Convert every detection's local (x, y, w, h) bbox into master-image
+  coordinates: global_x = tile_x_offset + local_x (same for y).
+- Dedupe detections that appear in overlap zones between adjacent
+  tiles:
+    - Compare bboxes for significant overlap (IoU threshold), OR
+    - Fuzzy-match on Dim_Description / Component_Name text
+    - Keep one instance, discard the duplicate(s).
+- Merge with title block extraction results.
+- Feed into existing BigQuery logging, Excel export, Fabric.js canvas
+  rendering — same downstream code as the adaptive approach.
+
+
+COST PROFILE
+-------------
+- More expensive than adaptive CV-based cropping:
+    - Every tile is billed regardless of content density.
+    - Overlap zones cause the same content to be sent (and billed)
+      more than once.
+    - More total images per page than a content-aware approach would
+      produce.
+- Can still be cheaper than sending one giant full-resolution page at
+  "high detail" in a single call, since that also gets internally
+  tiled by the vision API — but it's not the minimum-cost option.
+
+
+WHEN THIS APPROACH MAKES SENSE ANYWAY
+----------------------------------------
+- Faster to implement — no CV/OCR dependency, no tuning of contour
+  thresholds or dilation kernels.
+- Guarantees full coverage even on drawings with unusual layouts that
+  might confuse a content-detection heuristic.
+- Useful as a fallback path: run CV-based adaptive detection first,
+  and only fall back to sliding-window tiling for specific problem
+  pages where region detection returns too few / low-confidence
+  regions.
+
+
+DEPENDENCIES NEEDED
+---------------------
+- pypdfium2 — page rendering
+- PIL/Pillow — cropping
+- No CV/OCR libraries strictly required for this approach, though
+  Tesseract is still useful for the title block step.
