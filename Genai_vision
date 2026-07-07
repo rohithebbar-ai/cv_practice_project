@@ -1,0 +1,75 @@
+"""
+ISOLATED TEST — does the GenAI gateway actually read images?
+
+Based on the official Tata Steel GenAI documentation:
+- Images are NOT embedded inside 'messages' as image_url content blocks
+  (that's the OpenAI SDK convention, this gateway does NOT use it).
+- Images are sent as file attachments via the separate 'files' parameter,
+  as multipart form data alongside the payload.
+
+This script isolates that one variable: does the model respond correctly
+to an image when sent via 'files=', with a minimal prompt and no other
+complexity (no BOQ schema, no bbox instructions, nothing else).
+"""
+
+import json
+from google.oauth2 import service_account
+from google.auth.transport.requests import AuthorizedSession
+
+# ---- CONFIG: adjust these to match your .env values ----
+AUTH_URL = "https://genai-api-development-one-it-423929642383.asia-south1.run.app"
+API_URL = "https://tslgenaiapidev.corp.tatasteel.com/genai"
+SERVICE_ACCOUNT_PATH = "secrets/svc-genai-api-dev-oneit.json"
+
+ADID = "ayfph2508"       # your P number / adid
+API_KEY = "SGB7QI6ZVDLCL6W1"  # your genai api key
+DEPLOYMENT = "gpt-5.2"
+
+TEST_IMAGE_PATH = "local_uploads/PUT_ONE_SAVED_IMAGE_FILENAME_HERE.jpg"
+# ^ point this at one of the files already sitting in your local_uploads/
+#   folder from a previous test run, so we're testing with a real drawing.
+
+
+def main():
+    creds = service_account.IDTokenCredentials.from_service_account_file(
+        SERVICE_ACCOUNT_PATH,
+        target_audience=AUTH_URL
+    )
+    session = AuthorizedSession(creds)
+
+    messages = [
+        {"role": "user", "content": "Describe what you see in the attached image in one sentence."}
+    ]
+
+    payload = {
+        "deployment_name": DEPLOYMENT,
+        "temperature": "0.1",
+        "adid": ADID,
+        "apikey": API_KEY,
+        "messages": json.dumps(messages),
+        "max_tokens": "200",
+    }
+
+    # THIS is the key difference from your current code:
+    # image goes in 'files', NOT embedded in 'messages'.
+    with open(TEST_IMAGE_PATH, "rb") as f:
+        files = {
+            "files": (TEST_IMAGE_PATH.split("/")[-1], f, "image/jpeg")
+        }
+
+        print("Sending request with image via files= parameter...")
+        resp = session.post(API_URL, headers={}, data=payload, files=files, timeout=120)
+
+    print("STATUS CODE:", resp.status_code)
+    print("RAW RESPONSE:")
+    print(resp.text[:3000])
+
+    try:
+        print("\nPARSED JSON:")
+        print(json.dumps(resp.json(), indent=2)[:3000])
+    except Exception as e:
+        print(f"(Could not parse as JSON: {e})")
+
+
+if __name__ == "__main__":
+    main()
