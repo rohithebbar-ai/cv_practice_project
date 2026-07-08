@@ -1,81 +1,87 @@
-"""
-ISOLATED TEST — raw bytes (in-memory), NOT a file handle, NOT a temp file.
-Everything else matches the proven-working genai_vision.py exactly:
-- correct adid (ayfph2508h)
-- 300s timeout (not 120s)
-- same auth, same URL, same payload structure
+# ========================================================
+# 2. OPENAI SETUP & LLM LOGIC (now routed to Gemini)
+# ========================================================
 
-Purpose: find out definitively whether raw bytes ever worked fine, and the
-earlier "I can't see any image" failures were actually caused by the adid
-typo / short timeout all along — OR whether file-handle-vs-bytes is a real,
-separate issue with this gateway.
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE")
+url1 = os.getenv("URL1")
+url2 = os.getenv("URL2")
 
-Point RAW_IMAGE_PATH at one of the REAL drawing page files in local_uploads/
-(a .pdf_p1 file), not test.jpg, so this also doubles as a real-content test.
-"""
+DEPLOYMENT = "gemini-3.5-flash"
 
-import json
-from google.oauth2 import service_account
-from google.auth.transport.requests import AuthorizedSession
-
-AUTH_URL = "https://genai-api-development-one-it-423929642383.asia-south1.run.app"
-API_URL = "https://tslgenaiapidev.corp.tatasteel.com/genai"
-SERVICE_ACCOUNT_PATH = "secrets/svc-genai-api-dev-oneit.json"
-
-ADID = "ayfph2508h"        # confirmed correct
-API_KEY = "SGB7QI6ZVDLCL6W1"
-DEPLOYMENT = "gpt-5.2"
-
-# Point this at a REAL drawing page file already in local_uploads/
-RAW_IMAGE_PATH = "local_uploads/SESS-dp0gmeekp_GA___ASSIGNMENT_DRAWING_OF_CONV.NBC-1_R4__08.02.2021-Sheet 2.pdf_p1"
+_creds = service_account.IDTokenCredentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE,
+    target_audience=url1
+)
+_authed_session = AuthorizedSession(_creds)
 
 
-def main():
-    creds = service_account.IDTokenCredentials.from_service_account_file(
-        SERVICE_ACCOUNT_PATH,
-        target_audience=AUTH_URL
-    )
-    session = AuthorizedSession(creds)
+def call_llm(prompt_text: str, image_files: List[Dict[str, Any]] = None) -> str:
+    """
+    Calls the GENAI gateway (Gemini).
+    - prompt_text: full text instruction (system prompt + filenames etc.)
+    - image_files: list of {"filename": str, "bytes": bytes} dicts,
+      sent via files= (multipart, directly from memory), NOT embedded in messages content.
+    """
+    logger.info("Preparing LLM payload (files= based, Gemini)...")
 
-    messages = [
-        {"role": "user", "content": "Describe what you see in the attached engineering drawing in 2-3 sentences."}
-    ]
-
+    messages = [{"role": "user", "content": prompt_text}]
     payload = {
         "deployment_name": DEPLOYMENT,
-        "temperature": "0.1",
-        "adid": ADID,
-        "apikey": API_KEY,
-        "messages": json.dumps(messages),
-        "max_tokens": "200",
+        "temperature": "0.0",
+        "adid": os.getenv("P_No"),
+        "apikey": os.getenv("API_KEY"),
+        "grounding": "0",
+        "max_tokens": "12000",
+        "messages": json.dumps(messages)
     }
 
-    # THE VARIABLE UNDER TEST: read bytes into memory, do NOT keep a file
-    # handle open, do NOT write to a temp file. Pure in-memory bytes,
-    # exactly like agent.py's call_llm() currently does.
-    with open(RAW_IMAGE_PATH, "rb") as f:
-        image_bytes = f.read()
-    # file is now closed - image_bytes is a plain bytes object in memory
+    response = None
+    for attempt in range(3):
+        try:
+            if image_files:
+                img = image_files[0]
+                safe_filename = img["filename"]
+                if not safe_filename.lower().endswith((".jpg", ".jpeg", ".png")):
+                    safe_filename = safe_filename + ".jpg"
 
-    files = {"files": ("page.jpg", image_bytes, "image/jpeg")}
+                files = [('file', (safe_filename, img["bytes"], "image/jpeg"))]
 
-    print(f"Sending RAW BYTES (not file handle), size={len(image_bytes)} bytes...")
-    print("Using timeout=300 (matching the proven-working config)...")
+                response = _authed_session.post(
+                    url2,
+                    headers={},
+                    data=payload,
+                    files=files,
+                    timeout=180
+                )
+            else:
+                response = _authed_session.post(
+                    url2,
+                    headers={},
+                    data=payload,
+                    files=[],
+                    timeout=180
+                )
 
-    resp = session.post(API_URL, headers={}, data=payload, files=files, timeout=300)
+            if response.status_code == 200:
+                break
 
-    print("STATUS CODE:", resp.status_code)
-    print("RAW RESPONSE:")
-    print(resp.text[:2000])
+            logger.warning(f"Retry {attempt+1} - Status: {response.status_code}")
+            time.sleep(2)
+
+        except Exception as e:
+            logger.error(f"Retry {attempt+1} failed: {e}")
+            time.sleep(2)
+
+    if response is None or response.status_code != 200:
+        logger.error(f"LLM Call Failed: status {response.status_code if response else 'no response received'}")
+        return "[]"
 
     try:
-        parsed = resp.json()
-        content = parsed["choices"][0]["message"]["content"]
-        print("\n=== MODEL'S ANSWER ===")
-        print(content)
+        parsed_json = response.json()
+        llm_output = parsed_json["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        print(f"(Could not extract content: {e})")
+        logger.error("LLM Call Failed (parse): " + str(e))
+        logger.error(f"RAW RESPONSE WAS: {response.text}")
+        return "[]"
 
-
-if __name__ == "__main__":
-    main()
+    return str(llm_output)
