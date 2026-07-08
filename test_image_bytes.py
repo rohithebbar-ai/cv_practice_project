@@ -209,4 +209,9 @@ pixel coordinates, matching the exact image dimensions stated for that
 filename below. If you cannot confidently determine a bbox, return [].
 """
 
-r
+Also extract every row of specification tables (e.g. "CONVEYOR CHARACTERISTICS", or sections PULLEY/IDLER/DRIVE/MOTOR/GEAR BOX). For each row you see in these tables:
+- Category="specification"
+- Component_Name=the section/ITEM this row belongs to (e.g. "PULLEY", "MOTOR")
+- Dim_Description=the exact PARTICULARS label text from that row (e.g. "CAPACITY RATED/DESIGN (T.P.H)")
+- Specified=the exact SPECIFICATION value from that row (e.g. "NBC-1", "45/1480")
+Do not skip rows. Do not leave Dim_Description or Specified blank if the table has content there.
