@@ -334,8 +334,11 @@ Return ONLY a valid JSON array of objects. Do not write markdown, do not write e
 Each object MUST have the following keys exactly:
 "image_name", "Pt_No", "Dwg_View", "Dim_Type", "Dim_Description", "Specified", "Tolerance", "Measuring_Tools", "MC_No", "Insp_Type", "Category", "Component_Name", "Quantity", "bbox"
 "bbox" MUST be an array of exactly 4 integers [x, y, width, height] in
-pixel coordinates, matching the exact image dimensions stated for that
-filename below. If you cannot confidently determine a bbox, return [].
+pixel coordinates, where x+width <= image width and y+height <= image height
+as stated next to that image's filename below. Only provide a bbox for
+Category="dimension" rows, drawn tightly around that specific dimension's
+callout/number. For Category="component", "specification", and "title_block"
+rows, always return bbox=[] - never box an entire region or table.
 """
 
     prompt_text = system_instruction + "\n\n=== CURRENT BLUEPRINTS TO ANALYZE ===\n"
@@ -344,11 +347,20 @@ filename below. If you cannot confidently determine a bbox, return [].
     image_files_for_llm = []
 
     for img in payload.images:
-        prompt_text += f"\nFilename: {img.name}\n"
-
         header_split = img.b64.split(',', 1)
         encoded = header_split[1] if len(header_split) == 2 else header_split[0]
         image_bytes = base64.b64decode(encoded)
+
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as pil_probe:
+                img_w, img_h = pil_probe.size
+        except Exception:
+            img_w, img_h = None, None
+
+        if img_w and img_h:
+            prompt_text += f"\nFilename: {img.name} | Image size: {img_w}px width x {img_h}px height\n"
+        else:
+            prompt_text += f"\nFilename: {img.name}\n"
 
         image_files_for_llm.append({
             "filename": img.name,
@@ -539,6 +551,7 @@ HTML_CONTENT = """
 
             <div id="dataPanel" class="bg-white p-4 rounded shadow border-t-4 border-green-500 flex-grow flex flex-col hidden overflow-hidden">
                 <h2 class="text-lg font-bold text-green-700 mb-2">Interactive Feedback Checklist</h2>
+                <div id="categoryFilterBar" class="flex flex-wrap gap-1 mb-2 flex-shrink-0"></div>
                 <div class="overflow-auto border rounded flex-grow mb-2 bg-gray-50 relative">
                     <table class="min-w-full text-xs text-left whitespace-nowrap">
                         <thead class="bg-gray-200 sticky top-0 shadow-sm z-10">
@@ -619,7 +632,13 @@ window.onload = function() {
     window.APP_SESSION = "SESS-" + Math.random().toString(36).substr(2, 9);
     document.getElementById('sessionIdLabel').innerText = "Session: " + window.APP_SESSION;
 
-    window.APP_STATE = { images: [], currentIndex: 0, extractedData: [] };
+    window.APP_STATE = { images: [], currentIndex: 0, extractedData: [], categoryFilter: 'all' };
+    window.CATEGORY_COLORS = {
+        dimension: 'bg-indigo-100 text-indigo-800 border-indigo-300',
+        component: 'bg-amber-100 text-amber-800 border-amber-300',
+        specification: 'bg-emerald-100 text-emerald-800 border-emerald-300',
+        title_block: 'bg-rose-100 text-rose-800 border-rose-300'
+    };
     window.fabricScaleRatio = 1;
     window.imgOffsetX = 0;
     window.imgOffsetY = 0;
@@ -754,11 +773,37 @@ window.onload = function() {
         window.renderChecklistTable();
     };
 
+    window.renderCategoryFilterBar = function(pageData) {
+        var bar = document.getElementById('categoryFilterBar');
+        if (!bar) return;
+        var cats = ['all', 'dimension', 'component', 'specification', 'title_block'];
+        var counts = { all: pageData.length };
+        cats.slice(1).forEach(function(c) { counts[c] = pageData.filter(function(r){ return r.Category === c; }).length; });
+
+        bar.innerHTML = cats.map(function(c) {
+            var active = window.APP_STATE.categoryFilter === c;
+            var label = c === 'all' ? 'All' : c.replace('_', ' ');
+            var activeClasses = active ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-100';
+            return '<button class="px-2 py-1 rounded-full text-xs font-semibold border ' + activeClasses + '" onclick="window.setCategoryFilter(\\'' + c + '\\')">' + label + ' (' + counts[c] + ')</button>';
+        }).join('');
+    };
+
+    window.setCategoryFilter = function(cat) {
+        window.APP_STATE.categoryFilter = cat;
+        window.renderChecklistTable();
+    };
+
     window.renderChecklistTable = function() {
         var tbody = document.getElementById('dataBody'); tbody.innerHTML = '';
         if (window.APP_STATE.extractedData.length === 0) return;
         var currentImg = window.APP_STATE.images[window.APP_STATE.currentIndex].name;
         var pageData = window.APP_STATE.extractedData.filter(function(r) { return r.image_name === currentImg; });
+
+        window.renderCategoryFilterBar(pageData);
+
+        if (window.APP_STATE.categoryFilter !== 'all') {
+            pageData = pageData.filter(function(r) { return r.Category === window.APP_STATE.categoryFilter; });
+        }
 
         pageData.forEach(function(r) {
             var tr = document.createElement('tr');
@@ -766,7 +811,8 @@ window.onload = function() {
             tr.className = "hover:bg-gray-100 border-b " + (r.is_correct ? "row-correct" : "");
 
             var categoryOptions = ['dimension','component','specification','title_block'];
-            var categorySelectHtml = '<select onchange="window.updateRowData(\\'' + r._id + '\\', \\'Category\\', this.value)">' +
+            var badgeClass = window.CATEGORY_COLORS[r.Category] || 'bg-gray-100 text-gray-800 border-gray-300';
+            var categorySelectHtml = '<select class="rounded-full border px-2 py-0.5 text-xs font-semibold ' + badgeClass + '" onchange="window.updateRowData(\\'' + r._id + '\\', \\'Category\\', this.value)">' +
                 categoryOptions.map(function(opt) {
                     return '<option value="' + opt + '"' + (r.Category === opt ? ' selected' : '') + '>' + opt + '</option>';
                 }).join('') +
