@@ -304,16 +304,23 @@ def cell_pixel_rect(dwg_view: str, img_w: int, img_h: int, pad_ratio: float = 0.
         min(img_w, left + col_step + pad_x), min(img_h, top + row_step + pad_y)
     )
 
-def ocr_tokens(image_bytes: bytes):
-    """Runs Tesseract once on the page, returns word-level tokens plus
-    adjacent-word-pair tokens (to catch two-word values like 'ISMC 100')."""
-    if not OCR_AVAILABLE:
-        return []
+def _ocr_single_orientation(image_bytes: bytes, angle: int):
+    """angle: 0, 90 (CCW), or 270 (CW). Returns word dicts with bbox already
+    transformed back into ORIGINAL image pixel coordinates. The inverse
+    rotation formulas below were verified empirically against PIL's actual
+    transpose() output before use, not just derived on paper."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        orig_w, orig_h = img.size
+        if angle == 90:
+            rot = img.transpose(Image.Transpose.ROTATE_90)
+        elif angle == 270:
+            rot = img.transpose(Image.Transpose.ROTATE_270)
+        else:
+            rot = img
+        data = pytesseract.image_to_data(rot, output_type=pytesseract.Output.DICT)
     except Exception as e:
-        logger.warning(f"OCR skipped (tesseract unavailable or failed): {e}")
+        logger.warning(f"OCR pass (angle={angle}) skipped: {e}")
         return []
 
     words = []
@@ -326,17 +333,42 @@ def ocr_tokens(image_bytes: bytes):
             conf = -1
         if not text or conf < 30:
             continue
+        left, top, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+
+        if angle == 90:
+            x0 = orig_w - 1 - (top + h)
+            y0 = left
+            box_w, box_h = h, w
+        elif angle == 270:
+            x0 = top
+            y0 = orig_h - 1 - (left + w)
+            box_w, box_h = h, w
+        else:
+            x0, y0, box_w, box_h = left, top, w, h
+
         words.append({
-            "text": text,
-            "left": data["left"][i], "top": data["top"][i],
-            "width": data["width"][i], "height": data["height"][i],
-            "line_key": (data["block_num"][i], data["par_num"][i], data["line_num"][i]),
+            "text": text, "left": x0, "top": y0, "width": box_w, "height": box_h,
+            "line_key": (angle, data["block_num"][i], data["par_num"][i], data["line_num"][i]),
             "word_num": data["word_num"][i],
         })
+    return words
 
-    tokens = [{"text": w["text"], "bbox": (w["left"], w["top"], w["width"], w["height"])} for w in words]
+def ocr_tokens(image_bytes: bytes):
+    """Runs Tesseract at 0/90/270 degrees to also catch vertically-printed
+    dimension text (very common on GA drawings for height/vertical callouts -
+    a single horizontal-only OCR pass silently misses all of these), then
+    merges results (already in original-image coordinates), plus adjacent-
+    word-pair tokens per orientation to catch two-word values like 'ISMC 100'."""
+    if not OCR_AVAILABLE:
+        return []
 
-    words_sorted = sorted(words, key=lambda w: (w["line_key"], w["word_num"]))
+    all_words = []
+    for angle in (0, 90, 270):
+        all_words.extend(_ocr_single_orientation(image_bytes, angle))
+
+    tokens = [{"text": w["text"], "bbox": (w["left"], w["top"], w["width"], w["height"])} for w in all_words]
+
+    words_sorted = sorted(all_words, key=lambda w: (w["line_key"], w["word_num"]))
     for i in range(len(words_sorted) - 1):
         a, b = words_sorted[i], words_sorted[i + 1]
         if a["line_key"] == b["line_key"] and (b["word_num"] - a["word_num"]) == 1:
@@ -355,6 +387,11 @@ def find_best_match(candidate_text: str, tokens, cell_rect, min_ratio: float = 0
     if not norm_candidate:
         return None
 
+    # Short numeric values (e.g. "150") are unforgiving to fuzzy-match ratios -
+    # a single misread digit costs proportionally more than in a longer string.
+    is_short_numeric = bool(re.fullmatch(r'\d{1,4}', norm_candidate))
+    effective_min_ratio = 0.5 if is_short_numeric else min_ratio
+
     best_ratio, best_bbox = 0.0, None
     for tok in tokens:
         tx, ty, tw, th = tok["bbox"]
@@ -368,7 +405,7 @@ def find_best_match(candidate_text: str, tokens, cell_rect, min_ratio: float = 0
         if ratio > best_ratio:
             best_ratio, best_bbox = ratio, tok["bbox"]
 
-    if best_ratio >= min_ratio:
+    if best_ratio >= effective_min_ratio:
         return [int(best_bbox[0]), int(best_bbox[1]), int(best_bbox[2]), int(best_bbox[3])]
     return None
 
@@ -448,6 +485,13 @@ CRITICAL TGS-STYLE RULES (M-34597 Template):
 5. Tolerance: Extract the EXACT numerical limits (e.g., +0.027/+0.059). If the drawing only shows the fit class (e.g., 'h9', 'f7'), output the fit class in Tolerance.
 6. Dim_Type MUST be one of these exact codes for dimension rows only: OD, LD, CH, R, DH, INT, EXT, KS, GD.
 7. Dwg_View: the grid reference per Section 0 above (e.g. "G-11"). View_Label: the titled view/detail per Section 0.5 above.
+8. Measuring_Tools MUST be chosen from this fixed list only, based on Dim_Type and the dimension's magnitude - use the exact same wording every time for the same condition, never invent alternate phrasing (e.g. never write "Measuring Tape" as a synonym for "Steel Tape" - they must not be mixed):
+   - "Steel Tape" for Dim_Type=LD when Specified >= 500 (large lengths/heights/widths)
+   - "Vernier Caliper" for Dim_Type=LD when Specified < 500, and for Dim_Type=CH (chamfers) and Dim_Type=DH (hole diameters)
+   - "Radius Gauge" for Dim_Type=R
+   - "Vernier Caliper" for Dim_Type=KS (keyways/slots)
+   - "Feeler Gauge" for Dim_Type=GD (GD&T/general tolerance checks)
+   - "Vernier Caliper" for Dim_Type=INT or EXT when Specified < 500, otherwise "Steel Tape"
 For dimension rows, Category="dimension", Component_Name="", Quantity="".
 
 === 2. COMPONENTS, MEMBER CALLOUTS & REFERENCE LABELS (Category="component") ===
