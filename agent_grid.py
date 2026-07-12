@@ -350,7 +350,7 @@ Its exact position and size vary by sheet, so search for it rather than assuming
 a fixed location. Extract every labeled field inside it as its own row:
 - Category="title_block"
 - Component_Name=the plant/location line (e.g. "RM Location - West Bokaro Coal Mine")
-- Dwg_View=the grid reference per Section 0 above (title blocks are typically bottom-right, e.g. "A-1")
+- Dwg_View=the grid reference per Section 0 above - read the actual row letter and column number printed nearest the title block on this sheet; do not assume which letter/number that will be, since it varies by sheet layout
 - View_Label="Title Block"
 - Dim_Description=the field label exactly as printed (e.g. "REV", "DRG NO", "MATERIAL", "SCALE", "SHEET NO", "SHEET SIZE", "DATE", "DEPARTMENT", "EQUIP/AREA", "DETAIL", "DRN", "CHD", "APPD", "WEIGHT IN KG")
 - Specified=that field's value (e.g. "4", "GAD-38-01-02-03-307-009", "COAL", "1:100", "2 OF 2", "A1")
@@ -618,10 +618,10 @@ HTML_CONTENT = """
                     </div>
                 </div>
                 <div class="flex gap-3 mb-2 flex-shrink-0 text-xs text-gray-600">
-                    <span><span class="inline-block w-2.5 h-2.5 rounded-full mr-1" style="background:#4f46e5"></span>Dimension</span>
-                    <span><span class="inline-block w-2.5 h-2.5 rounded-full mr-1" style="background:#d97706"></span>Component</span>
-                    <span><span class="inline-block w-2.5 h-2.5 rounded-full mr-1" style="background:#e11d48"></span>Title block</span>
-                    <span><span class="inline-block w-2.5 h-2.5 rounded-full mr-1" style="background:#16a34a"></span>Marked correct</span>
+                    <span><span class="inline-block w-2.5 h-2.5 mr-1 border-2" style="border-color:#4f46e5"></span>Dimension</span>
+                    <span><span class="inline-block w-2.5 h-2.5 mr-1 border-2" style="border-color:#d97706"></span>Component</span>
+                    <span><span class="inline-block w-2.5 h-2.5 mr-1 border-2" style="border-color:#e11d48"></span>Title block</span>
+                    <span><span class="inline-block w-2.5 h-2.5 mr-1 border-2" style="border-color:#16a34a"></span>Marked correct</span>
                     <span class="text-gray-400">Click a dot to jump to its row</span>
                 </div>
 
@@ -828,7 +828,7 @@ window.onload = function() {
         if (window.APP_STATE.images.length > 0) { window.renderGridOverlay(); }
     };
 
-    window.GRID_ROWS = ['A','B','C','D','E','F','G','H'];
+    window.GRID_ROWS = ['H','G','F','E','D','C','B','A']; // top-to-bottom, matching the printed border
     window.GRID_COLS = 12;
     window.gridOverlayOn = true;
 
@@ -897,18 +897,20 @@ window.onload = function() {
                 var mx = left + ci * colStep + padX * (gc + 1);
                 var my = top + ri * rowStep + padY * (gr + 1);
                 var color = MARKER_COLORS[r.Category] || '#6b7280';
+                var boxSize = 10;
 
-                var dot = new fabric.Circle({
-                    left: mx, top: my, radius: 4, originX: 'center', originY: 'center',
-                    fill: r.is_correct ? '#16a34a' : color, stroke: 'white', strokeWidth: 1,
+                var box = new fabric.Rect({
+                    left: mx, top: my, width: boxSize, height: boxSize, originX: 'center', originY: 'center',
+                    fill: r.is_correct ? 'rgba(22,163,74,0.25)' : 'rgba(255,255,255,0.4)',
+                    stroke: r.is_correct ? '#16a34a' : color, strokeWidth: 2,
                     selectable: false, evented: true, hoverCursor: 'pointer'
                 });
-                dot.on('mousedown', function() { window.selectRowFromMarker(r._id); });
-                dot.on('mouseover', function() { window.showMarkerTooltip(r, mx, my); });
-                dot.on('mouseout', function() { window.hideMarkerTooltip(); });
+                box.on('mousedown', function() { window.selectRowFromMarker(r._id); });
+                box.on('mouseover', function() { window.showMarkerTooltip(r, mx, my); });
+                box.on('mouseout', function() { window.hideMarkerTooltip(); });
 
-                canvas.add(dot);
-                window.canvasRects['marker_' + r._id] = dot;
+                canvas.add(box);
+                window.canvasRects['marker_' + r._id] = box;
             });
         });
 
