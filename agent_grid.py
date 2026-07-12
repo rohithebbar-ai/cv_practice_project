@@ -14,6 +14,12 @@ import time
 import pypdfium2 as pdfium
 from PIL import Image
 import pandas as pd
+try:
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+from difflib import SequenceMatcher
 
 from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
@@ -243,6 +249,124 @@ def pil_to_b64(pil_img: Image.Image, format="JPEG") -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buffered.getvalue()).decode()
 
 # ========================================================
+# 3.5 OCR-BASED PRECISE MARKER MATCHING
+# ========================================================
+# The LLM's Dwg_View grid reference (e.g. "G-11") is reliable for WHICH cell
+# an item belongs to, but placing multiple items inside that cell still needs
+# a packed layout, which is not the item's real position. This section OCRs
+# the page once, then fuzzy-matches each row's own text against OCR'd words
+# constrained to that row's grid cell, to recover a real pixel bbox where
+# possible. No LLM coordinate guessing is involved anywhere in this section.
+
+GRID_ROW_ORDER = ['H', 'G', 'F', 'E', 'D', 'C', 'B', 'A']  # top-to-bottom, matches frontend
+GRID_COLS = 12  # columns numbered 12..1 left-to-right, matches frontend
+
+def parse_grid_ref(dwg_view: str):
+    if not dwg_view:
+        return None
+    m = re.search(r'([A-Ha-h])\s*-?\s*(\d{1,2})', dwg_view)
+    if not m:
+        return None
+    row_letter = m.group(1).upper()
+    if row_letter not in GRID_ROW_ORDER:
+        return None
+    try:
+        col_num = int(m.group(2))
+    except ValueError:
+        return None
+    row_idx = GRID_ROW_ORDER.index(row_letter)
+    col_idx = GRID_COLS - col_num
+    if col_idx < 0 or col_idx >= GRID_COLS:
+        return None
+    return row_idx, col_idx
+
+def cell_pixel_rect(dwg_view: str, img_w: int, img_h: int, pad_ratio: float = 0.15):
+    """Returns (x0, y0, x1, y1) in image pixel space for the cell, padded slightly
+    since the grid itself is an even-spacing approximation, not a measured one."""
+    ref = parse_grid_ref(dwg_view)
+    if not ref or not img_w or not img_h:
+        return None
+    row_idx, col_idx = ref
+    col_step = img_w / GRID_COLS
+    row_step = img_h / len(GRID_ROW_ORDER)
+    left = col_idx * col_step
+    top = row_idx * row_step
+    pad_x = col_step * pad_ratio
+    pad_y = row_step * pad_ratio
+    return (
+        max(0, left - pad_x), max(0, top - pad_y),
+        min(img_w, left + col_step + pad_x), min(img_h, top + row_step + pad_y)
+    )
+
+def ocr_tokens(image_bytes: bytes):
+    """Runs Tesseract once on the page, returns word-level tokens plus
+    adjacent-word-pair tokens (to catch two-word values like 'ISMC 100')."""
+    if not OCR_AVAILABLE:
+        return []
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    except Exception as e:
+        logger.warning(f"OCR skipped (tesseract unavailable or failed): {e}")
+        return []
+
+    words = []
+    n = len(data.get("text", []))
+    for i in range(n):
+        text = (data["text"][i] or "").strip()
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1
+        if not text or conf < 30:
+            continue
+        words.append({
+            "text": text,
+            "left": data["left"][i], "top": data["top"][i],
+            "width": data["width"][i], "height": data["height"][i],
+            "line_key": (data["block_num"][i], data["par_num"][i], data["line_num"][i]),
+            "word_num": data["word_num"][i],
+        })
+
+    tokens = [{"text": w["text"], "bbox": (w["left"], w["top"], w["width"], w["height"])} for w in words]
+
+    words_sorted = sorted(words, key=lambda w: (w["line_key"], w["word_num"]))
+    for i in range(len(words_sorted) - 1):
+        a, b = words_sorted[i], words_sorted[i + 1]
+        if a["line_key"] == b["line_key"] and (b["word_num"] - a["word_num"]) == 1:
+            left = min(a["left"], b["left"])
+            top = min(a["top"], b["top"])
+            right = max(a["left"] + a["width"], b["left"] + b["width"])
+            bottom = max(a["top"] + a["height"], b["top"] + b["height"])
+            tokens.append({"text": a["text"] + " " + b["text"], "bbox": (left, top, right - left, bottom - top)})
+
+    return tokens
+
+def find_best_match(candidate_text: str, tokens, cell_rect, min_ratio: float = 0.6):
+    if not candidate_text or not tokens:
+        return None
+    norm_candidate = re.sub(r'\s+', ' ', candidate_text.strip().upper())
+    if not norm_candidate:
+        return None
+
+    best_ratio, best_bbox = 0.0, None
+    for tok in tokens:
+        tx, ty, tw, th = tok["bbox"]
+        if cell_rect:
+            cx, cy = tx + tw / 2, ty + th / 2
+            x0, y0, x1, y1 = cell_rect
+            if not (x0 <= cx <= x1 and y0 <= cy <= y1):
+                continue
+        norm_tok = re.sub(r'\s+', ' ', tok["text"].strip().upper())
+        ratio = SequenceMatcher(None, norm_candidate, norm_tok).ratio()
+        if ratio > best_ratio:
+            best_ratio, best_bbox = ratio, tok["bbox"]
+
+    if best_ratio >= min_ratio:
+        return [int(best_bbox[0]), int(best_bbox[1]), int(best_bbox[2]), int(best_bbox[3])]
+    return None
+
+# ========================================================
 # 4. FASTAPI ENDPOINTS
 # ========================================================
 
@@ -411,11 +535,40 @@ Each object MUST have the following keys exactly:
             "Insp_Type": "F",
             "Category": "",
             "Component_Name": "",
-            "Quantity": ""
+            "Quantity": "",
+            "matched_bbox": None
         }]
 
     for item in parsed_data:
         item["_id"] = str(uuid.uuid4())
+
+    # OCR-based precise marker positions (best-effort; frontend falls back to
+    # its packed grid-cell layout when matched_bbox is null)
+    image_bytes_by_name = {f["filename"]: f["bytes"] for f in image_files_for_llm}
+    ocr_cache = {}
+
+    for item in parsed_data:
+        img_name = item.get("image_name")
+        img_bytes = image_bytes_by_name.get(img_name)
+        item["matched_bbox"] = None
+        if not img_bytes:
+            continue
+
+        if img_name not in ocr_cache:
+            try:
+                with Image.open(io.BytesIO(img_bytes)) as probe:
+                    iw, ih = probe.size
+            except Exception:
+                iw, ih = None, None
+            ocr_cache[img_name] = {"tokens": ocr_tokens(img_bytes), "w": iw, "h": ih}
+
+        cache = ocr_cache[img_name]
+        if not cache["w"] or not cache["h"]:
+            continue
+
+        candidate = item.get("Component_Name") or item.get("Specified") or item.get("Dim_Description") or ""
+        rect = cell_pixel_rect(item.get("Dwg_View", ""), cache["w"], cache["h"])
+        item["matched_bbox"] = find_best_match(candidate, cache["tokens"], rect)
 
     # Prepare sanitized log (text prompt only, no raw image bytes)
     log_row = {
@@ -622,7 +775,7 @@ HTML_CONTENT = """
                     <span><span class="inline-block w-2.5 h-2.5 mr-1 border-2" style="border-color:#d97706"></span>Component</span>
                     <span><span class="inline-block w-2.5 h-2.5 mr-1 border-2" style="border-color:#e11d48"></span>Title block</span>
                     <span><span class="inline-block w-2.5 h-2.5 mr-1 border-2" style="border-color:#16a34a"></span>Marked correct</span>
-                    <span class="text-gray-400">Click a dot to jump to its row</span>
+                    <span class="text-gray-400">Solid = OCR-matched position, dashed = approximate. Click to jump to its row</span>
                 </div>
 
                 <div id="canvasWrapper" class="relative bg-gray-300 border border-gray-400 rounded shadow-inner flex-grow overflow-hidden">
@@ -893,9 +1046,18 @@ window.onload = function() {
             var padX = colStep / (cols + 1), padY = rowStep / (rows + 1);
 
             items.forEach(function(r, idx) {
-                var gc = idx % cols, gr = Math.floor(idx / cols);
-                var mx = left + ci * colStep + padX * (gc + 1);
-                var my = top + ri * rowStep + padY * (gr + 1);
+                var mx, my, isPrecise;
+                if (r.matched_bbox && r.matched_bbox.length === 4) {
+                    var bx = r.matched_bbox[0], by = r.matched_bbox[1], bw = r.matched_bbox[2], bh = r.matched_bbox[3];
+                    mx = window.imgOffsetX + (bx + bw / 2) * window.fabricScaleRatio;
+                    my = window.imgOffsetY + (by + bh / 2) * window.fabricScaleRatio;
+                    isPrecise = true;
+                } else {
+                    var gc = idx % cols, gr = Math.floor(idx / cols);
+                    mx = left + ci * colStep + padX * (gc + 1);
+                    my = top + ri * rowStep + padY * (gr + 1);
+                    isPrecise = false;
+                }
                 var color = MARKER_COLORS[r.Category] || '#6b7280';
                 var boxSize = 10;
 
@@ -903,6 +1065,7 @@ window.onload = function() {
                     left: mx, top: my, width: boxSize, height: boxSize, originX: 'center', originY: 'center',
                     fill: r.is_correct ? 'rgba(22,163,74,0.25)' : 'rgba(255,255,255,0.4)',
                     stroke: r.is_correct ? '#16a34a' : color, strokeWidth: 2,
+                    strokeDashArray: isPrecise ? null : [3, 2],
                     selectable: false, evented: true, hoverCursor: 'pointer'
                 });
                 box.on('mousedown', function() { window.selectRowFromMarker(r._id); });
