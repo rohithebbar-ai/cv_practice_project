@@ -5,6 +5,7 @@ import re
 import logging
 import uuid
 import datetime
+import os
 from typing import List, Dict, Any
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -17,13 +18,18 @@ import pandas as pd
 try:
     import pytesseract
     OCR_AVAILABLE = True
+    # pip install only gets the Python wrapper - it still needs to find the
+    # actual tesseract.exe binary. Auto-point at the default Windows install
+    # location if present and not already on PATH.
+    _default_win_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.name == "nt" and os.path.exists(_default_win_tesseract):
+        pytesseract.pytesseract.tesseract_cmd = _default_win_tesseract
 except ImportError:
     OCR_AVAILABLE = False
 from difflib import SequenceMatcher
 
 from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
-import os
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -546,6 +552,8 @@ Each object MUST have the following keys exactly:
     # its packed grid-cell layout when matched_bbox is null)
     image_bytes_by_name = {f["filename"]: f["bytes"] for f in image_files_for_llm}
     ocr_cache = {}
+    ocr_matched_count = 0
+    ocr_tokens_found_any = False
 
     for item in parsed_data:
         img_name = item.get("image_name")
@@ -560,7 +568,10 @@ Each object MUST have the following keys exactly:
                     iw, ih = probe.size
             except Exception:
                 iw, ih = None, None
-            ocr_cache[img_name] = {"tokens": ocr_tokens(img_bytes), "w": iw, "h": ih}
+            tokens = ocr_tokens(img_bytes)
+            if tokens:
+                ocr_tokens_found_any = True
+            ocr_cache[img_name] = {"tokens": tokens, "w": iw, "h": ih}
 
         cache = ocr_cache[img_name]
         if not cache["w"] or not cache["h"]:
@@ -569,6 +580,11 @@ Each object MUST have the following keys exactly:
         candidate = item.get("Component_Name") or item.get("Specified") or item.get("Dim_Description") or ""
         rect = cell_pixel_rect(item.get("Dwg_View", ""), cache["w"], cache["h"])
         item["matched_bbox"] = find_best_match(candidate, cache["tokens"], rect)
+        if item["matched_bbox"]:
+            ocr_matched_count += 1
+
+    if OCR_AVAILABLE and not ocr_tokens_found_any:
+        logger.warning("OCR produced zero tokens across all images - Tesseract binary is likely not installed/reachable, even though pytesseract imported successfully.")
 
     # Prepare sanitized log (text prompt only, no raw image bytes)
     log_row = {
@@ -582,7 +598,15 @@ Each object MUST have the following keys exactly:
     }
     log_to_bigquery(BQ_EXTRACTION_TABLE, [log_row])
 
-    return {"data": parsed_data}
+    return {
+        "data": parsed_data,
+        "ocr_status": {
+            "library_available": OCR_AVAILABLE,
+            "tokens_found": ocr_tokens_found_any,
+            "matched_count": ocr_matched_count,
+            "total_count": len(parsed_data)
+        }
+    }
 
 @app.post("/api/feedback")
 async def receive_feedback(payload: FeedbackRequest):
@@ -1250,6 +1274,16 @@ window.onload = function() {
             window.APP_STATE.extractedData = resp.data;
             document.getElementById('dataPanel').classList.remove('hidden');
             logToScreen("Extraction complete and logged to BigQuery.");
+            if (resp.ocr_status) {
+                var s = resp.ocr_status;
+                if (!s.library_available) {
+                    logToScreen("OCR: pytesseract not installed - all markers will be approximate (dashed).");
+                } else if (!s.tokens_found) {
+                    logToScreen("OCR: pytesseract installed but found 0 words - Tesseract binary likely not reachable. All markers approximate (dashed).");
+                } else {
+                    logToScreen("OCR: precisely matched " + s.matched_count + " of " + s.total_count + " rows (solid markers).");
+                }
+            }
             window.renderChecklistTable();
         }).catch(function(err) {
             logToScreen("EXTRACTION FAILED: " + err.message); alert("Extraction Failed: " + err.message);
