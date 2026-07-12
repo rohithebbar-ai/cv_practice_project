@@ -297,6 +297,14 @@ plan view). Keep these as separate rows with the same Component_Name but
 different Dwg_View values, so which physical instance is which is never
 ambiguous, and nothing gets merged or lost.
 
+=== 0.5 VIEW / DETAIL LABELING (mandatory for every row) ===
+This sheet is made up of several separately-titled views and details (e.g.
+"TYP. GALLERY CROSS SECTION", "DETAIL # D3", "VIEW - AA", "VIEW 1-1"), each
+printed with its own underlined title on the drawing. For EVERY row, read
+which titled view/detail it visually belongs to and populate "View_Label"
+with that title exactly as printed. This groups rows by the drawing's own
+named sub-drawings, not just by raw grid coordinate.
+
 This drawing may contain THREE distinct kinds of content. Extract ALL of
 them - do not prioritize dimensions over the others. Each kind of content
 produces its own row(s) in the output, distinguished by "Category".
@@ -309,18 +317,31 @@ CRITICAL TGS-STYLE RULES (M-34597 Template):
 4. Specified: Only the dimension/fit/thread (e.g., Ø320 r6, 1546, 2x45°, M16x30).
 5. Tolerance: Extract the EXACT numerical limits (e.g., +0.027/+0.059). If the drawing only shows the fit class (e.g., 'h9', 'f7'), output the fit class in Tolerance.
 6. Dim_Type MUST be one of these exact codes for dimension rows only: OD, LD, CH, R, DH, INT, EXT, KS, GD.
-7. Dwg_View: the grid reference per Section 0 above (e.g. "G-11").
+7. Dwg_View: the grid reference per Section 0 above (e.g. "G-11"). View_Label: the titled view/detail per Section 0.5 above.
 For dimension rows, Category="dimension", Component_Name="", Quantity="".
 
-=== 2. NAMED COMPONENTS (Category="component") ===
-Extract physical named components (e.g. hopper, pulley, idler, conveyor,
-walkway, monorail, sizer, scraper, feeder, magnetic separator) visible on the
-drawing:
+=== 2. COMPONENTS, MEMBER CALLOUTS & REFERENCE LABELS (Category="component") ===
+This category covers every labeled thing on the drawing that is not a
+dimension value and not a title block field. It has three sub-types, all
+using Category="component":
+a) Named physical equipment/components (e.g. hopper, pulley, idler, conveyor,
+   walkway, monorail, sizer, scraper, feeder, magnetic separator, cable tray,
+   safety guard, tramp iron chute).
+b) Structural member/section callouts - any label specifying a steel section
+   attached to a drawn member (e.g. "ISA 65x65x6", "ISA 50x50x6", "ISMC 100",
+   "ISMB 250"). Extract every one visible, not just the first.
+c) Centerline and reference labels (e.g. "OF GALLERY" / "CL OF GALLERY",
+   "OF CONVEYOR", "IDLER FXG CRS", "SHORT POST CRS", "T.O.S.", "F.G.L.").
+Do not skip (b) and (c) just because they look like annotations rather than
+named equipment - if it is printed text labeling a feature on the drawing
+and it is not a dimension number and not in the title block, it belongs here.
+For every row in this category:
 - Category="component"
-- Component_Name=the component's name (e.g. "Truck Dump Hopper")
+- Component_Name=the label exactly as printed (e.g. "ISA 65x65x6", "IDLER FXG CRS", "Truck Dump Hopper")
 - Dwg_View=the grid reference per Section 0 above
+- View_Label=the titled view/detail per Section 0.5 above
 - Dim_Type="NA"
-- Quantity=populate only if the drawing itself explicitly shows a count next to this component (e.g. a legend symbol marked "28 NOS."); otherwise leave "".
+- Quantity=populate only if the drawing itself explicitly shows a count next to this item (e.g. a legend symbol marked "28 NOS."); otherwise leave "".
 - Dimension-specific fields (Tolerance, Measuring_Tools, etc.) stay "" or "N/A".
 
 === 3. TITLE BLOCK (Category="title_block") ===
@@ -330,6 +351,7 @@ a fixed location. Extract every labeled field inside it as its own row:
 - Category="title_block"
 - Component_Name=the plant/location line (e.g. "RM Location - West Bokaro Coal Mine")
 - Dwg_View=the grid reference per Section 0 above (title blocks are typically bottom-right, e.g. "A-1")
+- View_Label="Title Block"
 - Dim_Description=the field label exactly as printed (e.g. "REV", "DRG NO", "MATERIAL", "SCALE", "SHEET NO", "SHEET SIZE", "DATE", "DEPARTMENT", "EQUIP/AREA", "DETAIL", "DRN", "CHD", "APPD", "WEIGHT IN KG")
 - Specified=that field's value (e.g. "4", "GAD-38-01-02-03-307-009", "COAL", "1:100", "2 OF 2", "A1")
 - Dim_Type="NA", Quantity=""
@@ -346,15 +368,8 @@ title block.
 OUTPUT FORMAT:
 Return ONLY a valid JSON array of objects. Do not write markdown, do not write explanations.
 Each object MUST have the following keys exactly:
-"image_name", "Pt_No", "Dwg_View", "Dim_Type", "Dim_Description", "Specified", "Tolerance", "Measuring_Tools", "MC_No", "Insp_Type", "Category", "Component_Name", "Quantity", "bbox"
-"Dwg_View" is mandatory on every row per Section 0 above.
-"bbox" MUST be an array of exactly 4 integers [x, y, width, height] in
-pixel coordinates, where x+width <= image width and y+height <= image height
-as stated next to that image's filename below. Only provide a bbox for
-Category="dimension" rows, drawn tightly around that specific dimension's
-callout/number. For Category="component" and "title_block" rows, always
-return bbox=[] - never box an entire region or table. Dwg_View, not bbox,
-is the primary locator for non-dimension rows.
+"image_name", "Pt_No", "Dwg_View", "View_Label", "Dim_Type", "Dim_Description", "Specified", "Tolerance", "Measuring_Tools", "MC_No", "Insp_Type", "Category", "Component_Name", "Quantity"
+"Dwg_View" and "View_Label" are mandatory on every row per Sections 0 and 0.5 above - they are the only locators needed, do not attempt to estimate pixel coordinates.
 """
 
     prompt_text = system_instruction + "\n\n=== CURRENT BLUEPRINTS TO ANALYZE ===\n"
@@ -367,16 +382,7 @@ is the primary locator for non-dimension rows.
         encoded = header_split[1] if len(header_split) == 2 else header_split[0]
         image_bytes = base64.b64decode(encoded)
 
-        try:
-            with Image.open(io.BytesIO(image_bytes)) as pil_probe:
-                img_w, img_h = pil_probe.size
-        except Exception:
-            img_w, img_h = None, None
-
-        if img_w and img_h:
-            prompt_text += f"\nFilename: {img.name} | Image size: {img_w}px width x {img_h}px height\n"
-        else:
-            prompt_text += f"\nFilename: {img.name}\n"
+        prompt_text += f"\nFilename: {img.name}\n"
 
         image_files_for_llm.append({
             "filename": img.name,
@@ -395,6 +401,7 @@ is the primary locator for non-dimension rows.
             "image_name": payload.images[0].name,
             "Pt_No": 1,
             "Dwg_View": "FAIL",
+            "View_Label": "",
             "Dim_Type": "ERR",
             "Dim_Description": "API PARSE ERROR",
             "Specified": "Check Terminal Logs",
@@ -404,14 +411,11 @@ is the primary locator for non-dimension rows.
             "Insp_Type": "F",
             "Category": "",
             "Component_Name": "",
-            "Quantity": "",
-            "bbox": []
+            "Quantity": ""
         }]
 
     for item in parsed_data:
         item["_id"] = str(uuid.uuid4())
-        if "bbox" not in item:
-            item["bbox"] = []
 
     # Prepare sanitized log (text prompt only, no raw image bytes)
     log_row = {
@@ -449,7 +453,7 @@ async def download_excel(payload: List[Dict[str, Any]]):
     for item in payload:
         formatted_data.append({
             "Category": item.get("Category", ""), "Component": item.get("Component_Name", ""),
-            "View": item.get("Dwg_View", ""),
+            "View": item.get("Dwg_View", ""), "View Label": item.get("View_Label", ""),
             "Pt. No.": item.get("Pt_No", ""),
             "Dim Type": item.get("Dim_Type", ""), "Dim Description": item.get("Dim_Description", ""),
             "Specified": item.get("Specified", ""), "Qty": item.get("Quantity", ""), "Tolerance": item.get("Tolerance", ""),
@@ -517,7 +521,6 @@ HTML_CONTENT = """
         table input, table select { width: 100%; border: 1px solid transparent; padding: 2px; border-radius: 3px; }
         table input:focus, table select:focus { border: 1px solid #3b82f6; outline: none; background: #eff6ff; }
         .row-correct { background-color: #dcfce7 !important; }
-        .drawing-active { border: 2px solid red !important; box-shadow: 0 0 10px red; }
     </style>
 </head>
 <body class="bg-gray-100 min-h-screen text-gray-800">
@@ -584,7 +587,6 @@ HTML_CONTENT = """
                                 <th class="py-2 px-2 border-r">Qty</th>
                                 <th class="py-2 px-2 border-r">Tolerance</th>
                                 <th class="py-2 px-2 border-r">Tool</th>
-                                <th class="py-2 px-1 border-r text-center">Box</th>
                                 <th class="py-2 px-1 text-center">Del</th>
                             </tr>
                         </thead>
@@ -606,6 +608,7 @@ HTML_CONTENT = """
                     <h2 class="text-lg font-bold">Blueprint View</h2>
                     <div class="flex gap-2">
                         <button id="resetZoomBtn" class="px-4 py-1 rounded text-blue-600 font-bold hover:bg-blue-100 bg-gray-100">Reset View</button>
+                        <button id="gridToggleBtn" class="px-4 py-1 rounded text-red-600 font-bold hover:bg-red-100 bg-gray-100" onclick="window.toggleGridOverlay()">Grid</button>
                         <button id="prevBtn" class="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300">&larr;</button>
                         <span id="imgCounter" class="text-gray-700 mt-1 font-bold text-sm">0 of 0</span>
                         <button id="nextBtn" class="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300">&rarr;</button>
@@ -660,9 +663,8 @@ window.onload = function() {
     window.imgOffsetX = 0;
     window.imgOffsetY = 0;
 
-    // Canvas mapping to link Fabric rects to Row IDs
+    // Tracks the grid-overlay fabric objects so they can be cleared/redrawn
     window.canvasRects = {};
-    window.activeDrawingRowId = null;
 
     var canvas = new fabric.Canvas('fabricCanvas', { selection: false });
 
@@ -676,18 +678,9 @@ window.onload = function() {
         opt.e.preventDefault(); opt.e.stopPropagation();
     });
 
-    // Drawing Logic for Row Bounding Boxes
-    var isDrawingRect = false;
-    var startX, startY, tempRect;
-
+    // Alt-drag panning on the canvas
     canvas.on('mouse:down', function(opt) {
-        if (opt.e.altKey) { window.isDraggingPan = true; window.lastPosX = opt.e.clientX; window.lastPosY = opt.e.clientY; return; }
-        if (!window.activeDrawingRowId) return;
-
-        isDrawingRect = true;
-        var pointer = canvas.getPointer(opt.e); startX = pointer.x; startY = pointer.y;
-        tempRect = new fabric.Rect({ left: startX, top: startY, width: 0, height: 0, fill: 'rgba(255,0,0,0.2)', stroke: 'red', strokeWidth: 2/canvas.getZoom(), selectable: true });
-        canvas.add(tempRect);
+        if (opt.e.altKey) { window.isDraggingPan = true; window.lastPosX = opt.e.clientX; window.lastPosY = opt.e.clientY; }
     });
 
     canvas.on('mouse:move', function(opt) {
@@ -695,59 +688,12 @@ window.onload = function() {
             var vpt = canvas.viewportTransform;
             vpt[4] += opt.e.clientX - window.lastPosX;
             vpt[5] += opt.e.clientY - window.lastPosY;
-            canvas.requestRenderAll(); window.lastPosX = opt.e.clientX; window.lastPosY = opt.e.clientY; return;
+            canvas.requestRenderAll(); window.lastPosX = opt.e.clientX; window.lastPosY = opt.e.clientY;
         }
-        if (!isDrawingRect) return;
-        var pointer = canvas.getPointer(opt.e);
-        if (pointer.x < startX) tempRect.set({ left: pointer.x });
-        if (pointer.y < startY) tempRect.set({ top: pointer.y });
-        tempRect.set({ width: Math.abs(pointer.x - startX), height: Math.abs(pointer.y - startY) });
-        canvas.renderAll();
     });
 
     canvas.on('mouse:up', function() {
-        if (window.isDraggingPan) { canvas.setViewportTransform(canvas.viewportTransform); window.isDraggingPan = false; return; }
-        if (!isDrawingRect) return;
-        isDrawingRect = false;
-
-        if (tempRect.width < 5 || tempRect.height < 5) { canvas.remove(tempRect); return; }
-
-        var rowId = window.activeDrawingRowId;
-        var rowData = window.APP_STATE.extractedData.find(function(r){ return r._id === rowId; });
-        if(rowData) {
-            rowData.bbox = [
-                (tempRect.left - window.imgOffsetX) / window.fabricScaleRatio,
-                (tempRect.top - window.imgOffsetY) / window.fabricScaleRatio,
-                (tempRect.width * tempRect.scaleX) / window.fabricScaleRatio,
-                (tempRect.height * tempRect.scaleY) / window.fabricScaleRatio
-            ];
-            logToScreen("Box drawn and linked to row: " + rowData.Dim_Type);
-        }
-
-        // --- NEW LINE ADDED HERE ---
-        canvas.remove(tempRect); // Destroy the temporary red drawing box
-        // ----------------------------
-
-        window.activeDrawingRowId = null;
-        document.getElementById('canvasWrapper').classList.remove('drawing-active');
-        canvas.defaultCursor = 'default';
-        window.renderCanvasBoxes();
-        window.renderChecklistTable();
-    });
-
-    canvas.on('object:modified', function(e) {
-        var obj = e.target;
-        if(obj.rowId) {
-            var rowData = window.APP_STATE.extractedData.find(function(r){ return r._id === obj.rowId; });
-            if(rowData) {
-                rowData.bbox = [
-                    (obj.left - window.imgOffsetX) / window.fabricScaleRatio,
-                    (obj.top - window.imgOffsetY) / window.fabricScaleRatio,
-                    (obj.width * obj.scaleX) / window.fabricScaleRatio,
-                    (obj.height * obj.scaleY) / window.fabricScaleRatio
-                ];
-            }
-        }
+        if (window.isDraggingPan) { canvas.setViewportTransform(canvas.viewportTransform); window.isDraggingPan = false; }
     });
 
     window.updateRowData = function(id, field, value) {
@@ -757,24 +703,15 @@ window.onload = function() {
                 row.is_correct = value;
                 var tr = document.getElementById("tr_" + id);
                 if(value) tr.classList.add('row-correct'); else tr.classList.remove('row-correct');
-                window.renderCanvasBoxes();
             } else {
                 row[field] = value;
             }
         }
     };
 
-    window.activateDrawing = function(id) {
-        window.activeDrawingRowId = id;
-        document.getElementById('canvasWrapper').classList.add('drawing-active');
-        canvas.defaultCursor = 'crosshair';
-        logToScreen("Click and drag on the image to draw a bounding box for this item.");
-    };
-
     window.deleteRow = function(id) {
         window.APP_STATE.extractedData = window.APP_STATE.extractedData.filter(function(r){ return r._id !== id; });
         window.renderChecklistTable();
-        window.renderCanvasBoxes();
     };
 
     document.getElementById('addRowBtn').onclick = function() {
@@ -783,8 +720,8 @@ window.onload = function() {
         var newRow = {
             _id: "MANUAL-" + Math.random().toString(36).substr(2, 9),
             image_name: currentImg,
-            Category: "dimension", Component_Name: "", Dwg_View: "",
-            Pt_No: "", Dim_Type: "NEW", Dim_Description: "NEW DIM", Specified: "", Quantity: "", Tolerance: "", Measuring_Tools: "", bbox: [], is_correct: false
+            Category: "dimension", Component_Name: "", Dwg_View: "", View_Label: "Ungrouped",
+            Pt_No: "", Dim_Type: "NEW", Dim_Description: "NEW DIM", Specified: "", Quantity: "", Tolerance: "", Measuring_Tools: "", is_correct: false
         };
         window.APP_STATE.extractedData.push(newRow);
         window.renderChecklistTable();
@@ -822,7 +759,23 @@ window.onload = function() {
             pageData = pageData.filter(function(r) { return r.Category === window.APP_STATE.categoryFilter; });
         }
 
+        var groupOrder = [];
+        var groups = {};
         pageData.forEach(function(r) {
+            var key = r.View_Label || 'Ungrouped';
+            if (!groups[key]) { groups[key] = []; groupOrder.push(key); }
+            groups[key].push(r);
+        });
+
+        groupOrder.forEach(function(groupKey) {
+            var groupRows = groups[groupKey];
+
+            var headerTr = document.createElement('tr');
+            headerTr.className = "bg-blue-50 border-b border-t-2 border-blue-200";
+            headerTr.innerHTML = '<td colspan="12" class="py-1 px-2 font-bold text-blue-800 text-xs">' + groupKey + '</td>';
+            tbody.appendChild(headerTr);
+
+            groupRows.forEach(function(r) {
             var tr = document.createElement('tr');
             tr.id = "tr_" + r._id;
             tr.className = "hover:bg-gray-100 border-b " + (r.is_correct ? "row-correct" : "");
@@ -848,56 +801,63 @@ window.onload = function() {
             html += '<td class="py-1 px-1 border-r"><input type="text" class="text-red-600 font-mono" value="' + (r.Tolerance || '') + '" onchange="window.updateRowData(\\'' + r._id + '\\', \\'Tolerance\\', this.value)"></td>';
             // <--- ADD THIS LINE FOR MEASURING TOOLS:
             html += '<td class="py-1 px-1 border-r"><input type="text" value="' + (r.Measuring_Tools || '') + '" onchange="window.updateRowData(\\'' + r._id + '\\', \\'Measuring_Tools\\', this.value)"></td>';
-            var boxColor = (r.bbox && r.bbox.length === 4) ? "bg-green-100 text-green-800" : "bg-gray-200 text-gray-700";
-            html += '<td class="py-1 px-1 border-r text-center"><button class="' + boxColor + ' px-2 py-1 rounded text-xs font-bold hover:bg-blue-200" onclick="window.activateDrawing(\\'' + r._id + '\\')">Box</button></td>';
             html += '<td class="py-1 px-1 text-center"><button class="text-red-500 hover:text-white hover:bg-red-500 px-2 py-1 rounded text-xs font-bold" onclick="window.deleteRow(\\'' + r._id + '\\')">X</button></td>';
 
             tr.innerHTML = html;
             tbody.appendChild(tr);
+            });
         });
     };
 
-    window.renderCanvasBoxes = function() {
+    window.GRID_ROWS = ['A','B','C','D','E','F','G','H'];
+    window.GRID_COLS = 12;
+    window.gridOverlayOn = true;
+
+    window.renderGridOverlay = function() {
         Object.keys(window.canvasRects).forEach(function(key) {
             canvas.remove(window.canvasRects[key]);
-            if(window.canvasRects[key].textObj) canvas.remove(window.canvasRects[key].textObj);
         });
         window.canvasRects = {};
+        if (!window.gridOverlayOn) { canvas.requestRenderAll(); return; }
+        if (window.APP_STATE.images.length === 0) return;
 
-        var currentImg = window.APP_STATE.images[window.APP_STATE.currentIndex].name;
-        var pageData = window.APP_STATE.extractedData.filter(function(r) { return r.image_name === currentImg; });
+        var imgObj = window.APP_STATE.images[window.APP_STATE.currentIndex];
+        var imgW = imgObj._pxWidth, imgH = imgObj._pxHeight;
+        if (!imgW || !imgH) return;
 
-        pageData.forEach(function(r) {
-            if(r.bbox && r.bbox.length === 4) {
-                var scaledX = (r.bbox[0] * window.fabricScaleRatio) + window.imgOffsetX;
-                var scaledY = (r.bbox[1] * window.fabricScaleRatio) + window.imgOffsetY;
-                var scaledW = r.bbox[2] * window.fabricScaleRatio;
-                var scaledH = r.bbox[3] * window.fabricScaleRatio;
+        var left = window.imgOffsetX, top = window.imgOffsetY;
+        var w = imgW * window.fabricScaleRatio, h = imgH * window.fabricScaleRatio;
+        var colStep = w / window.GRID_COLS;
+        var rowStep = h / window.GRID_ROWS.length;
 
-                var color = r.is_correct ? "green" : "blue";
-
-                var rect = new fabric.Rect({
-                    left: scaledX, top: scaledY, width: scaledW, height: scaledH,
-                    fill: 'rgba(0,0,0,0)', stroke: color, strokeWidth: 2 / canvas.getZoom(),
-                    borderColor: color, cornerColor: color, transparentCorners: false,
-                    selectable: true, hasRotatingPoint: false
-                });
-                rect.rowId = r._id;
-
-                var text = new fabric.Text(r.Dim_Type + (r.Pt_No ? " ("+r.Pt_No+")" : ""), {
-                    left: scaledX, top: scaledY - (15/canvas.getZoom()), fontSize: 14/canvas.getZoom(), fill: 'white', backgroundColor: color, selectable: false
-                });
-                rect.textObj = text;
-
-                rect.on('moving', function() { text.set({left: rect.left, top: rect.top - (15/canvas.getZoom())}); });
-                rect.on('scaling', function() { text.set({left: rect.left, top: rect.top - (15/canvas.getZoom())}); });
-
-                canvas.add(rect, text);
-                window.canvasRects[r._id] = rect;
-            }
-        });
-        // <--- ADD THIS LINE TO INSTANTLY CLEAR DELETED BOXES
+        for (var c = 1; c < window.GRID_COLS; c++) {
+            var x = left + c * colStep;
+            var line = new fabric.Line([x, top, x, top + h], { stroke: 'rgba(220,38,38,0.35)', strokeWidth: 1, selectable: false, evented: false });
+            canvas.add(line); window.canvasRects['col_' + c] = line;
+        }
+        for (var rIdx = 1; rIdx < window.GRID_ROWS.length; rIdx++) {
+            var y = top + rIdx * rowStep;
+            var line = new fabric.Line([left, y, left + w, y], { stroke: 'rgba(220,38,38,0.35)', strokeWidth: 1, selectable: false, evented: false });
+            canvas.add(line); window.canvasRects['row_' + rIdx] = line;
+        }
+        // Column numbers run high-to-low left-to-right (matches the printed border); row letters A-H top-to-bottom
+        for (var ci = 0; ci < window.GRID_COLS; ci++) {
+            var label = window.GRID_COLS - ci;
+            var lx = left + ci * colStep + colStep / 2;
+            var t1 = new fabric.Text(String(label), { left: lx, top: top - 14, fontSize: 11, fill: 'rgba(185,28,28,0.7)', selectable: false, evented: false, originX: 'center' });
+            canvas.add(t1); window.canvasRects['colLabel_' + ci] = t1;
+        }
+        for (var ri = 0; ri < window.GRID_ROWS.length; ri++) {
+            var ly = top + ri * rowStep + rowStep / 2;
+            var t2 = new fabric.Text(window.GRID_ROWS[ri], { left: left - 16, top: ly - 6, fontSize: 11, fill: 'rgba(185,28,28,0.7)', selectable: false, evented: false });
+            canvas.add(t2); window.canvasRects['rowLabel_' + ri] = t2;
+        }
         canvas.requestRenderAll();
+    };
+
+    window.toggleGridOverlay = function() {
+        window.gridOverlayOn = !window.gridOverlayOn;
+        window.renderGridOverlay();
     };
 
     window.renderImage = function() {
@@ -915,10 +875,11 @@ window.onload = function() {
             img.set({ originX: 'center', originY: 'center', left: w.clientWidth/2, top: w.clientHeight/2, scaleX: ratio, scaleY: ratio });
             window.imgOffsetX = (w.clientWidth - (img.width * ratio)) / 2;
             window.imgOffsetY = (w.clientHeight - (img.height * ratio)) / 2;
+            imgObj._pxWidth = img.width; imgObj._pxHeight = img.height;
             canvas.setBackgroundImage(img, canvas.renderAll.bind(canvas));
 
             window.renderChecklistTable();
-            window.renderCanvasBoxes();
+            window.renderGridOverlay();
         });
     };
 
@@ -976,7 +937,6 @@ window.onload = function() {
             document.getElementById('dataPanel').classList.remove('hidden');
             logToScreen("Extraction complete and logged to BigQuery.");
             window.renderChecklistTable();
-            window.renderCanvasBoxes();
         }).catch(function(err) {
             logToScreen("EXTRACTION FAILED: " + err.message); alert("Extraction Failed: " + err.message);
         }).finally(function() {
