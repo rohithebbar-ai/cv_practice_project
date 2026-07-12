@@ -521,6 +521,7 @@ HTML_CONTENT = """
         table input, table select { width: 100%; border: 1px solid transparent; padding: 2px; border-radius: 3px; }
         table input:focus, table select:focus { border: 1px solid #3b82f6; outline: none; background: #eff6ff; }
         .row-correct { background-color: #dcfce7 !important; }
+        .marker-flash { background-color: #fef08a !important; transition: background-color 0.3s ease; }
     </style>
 </head>
 <body class="bg-gray-100 min-h-screen text-gray-800">
@@ -608,11 +609,20 @@ HTML_CONTENT = """
                     <h2 class="text-lg font-bold">Blueprint View</h2>
                     <div class="flex gap-2">
                         <button id="resetZoomBtn" class="px-4 py-1 rounded text-blue-600 font-bold hover:bg-blue-100 bg-gray-100">Reset View</button>
+                        <button id="zoomOutBtn" class="px-3 py-1 rounded text-gray-700 font-bold hover:bg-gray-200 bg-gray-100">-</button>
+                        <button id="zoomInBtn" class="px-3 py-1 rounded text-gray-700 font-bold hover:bg-gray-200 bg-gray-100">+</button>
                         <button id="gridToggleBtn" class="px-4 py-1 rounded text-red-600 font-bold hover:bg-red-100 bg-gray-100" onclick="window.toggleGridOverlay()">Grid</button>
                         <button id="prevBtn" class="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300">&larr;</button>
                         <span id="imgCounter" class="text-gray-700 mt-1 font-bold text-sm">0 of 0</span>
                         <button id="nextBtn" class="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300">&rarr;</button>
                     </div>
+                </div>
+                <div class="flex gap-3 mb-2 flex-shrink-0 text-xs text-gray-600">
+                    <span><span class="inline-block w-2.5 h-2.5 rounded-full mr-1" style="background:#4f46e5"></span>Dimension</span>
+                    <span><span class="inline-block w-2.5 h-2.5 rounded-full mr-1" style="background:#d97706"></span>Component</span>
+                    <span><span class="inline-block w-2.5 h-2.5 rounded-full mr-1" style="background:#e11d48"></span>Title block</span>
+                    <span><span class="inline-block w-2.5 h-2.5 rounded-full mr-1" style="background:#16a34a"></span>Marked correct</span>
+                    <span class="text-gray-400">Click a dot to jump to its row</span>
                 </div>
 
                 <div id="canvasWrapper" class="relative bg-gray-300 border border-gray-400 rounded shadow-inner flex-grow overflow-hidden">
@@ -670,6 +680,14 @@ window.onload = function() {
 
     // View controls (FIXED: Identity matrix added)
     document.getElementById('resetZoomBtn').onclick = function() { canvas.setViewportTransform([1,0,0,1,0,0]); };
+    document.getElementById('zoomInBtn').onclick = function() {
+        var zoom = Math.min(canvas.getZoom() * 1.3, 20);
+        canvas.zoomToPoint({ x: canvas.getWidth()/2, y: canvas.getHeight()/2 }, zoom);
+    };
+    document.getElementById('zoomOutBtn').onclick = function() {
+        var zoom = Math.max(canvas.getZoom() / 1.3, 0.5);
+        canvas.zoomToPoint({ x: canvas.getWidth()/2, y: canvas.getHeight()/2 }, zoom);
+    };
 
     canvas.on('mouse:wheel', function(opt) {
         var zoom = canvas.getZoom() * Math.pow(0.999, opt.e.deltaY);
@@ -792,7 +810,7 @@ window.onload = function() {
             html += '<td class="py-1 px-1 border-r text-center"><input type="checkbox" style="width:16px; height:16px; cursor:pointer;" onchange="window.updateRowData(\\'' + r._id + '\\', \\'is_correct\\', this.checked)" ' + (r.is_correct ? 'checked' : '') + '></td>';
             html += '<td class="py-1 px-1 border-r">' + categorySelectHtml + '</td>';
             html += '<td class="py-1 px-1 border-r"><input type="text" value="' + (r.Component_Name || '') + '" onchange="window.updateRowData(\\'' + r._id + '\\', \\'Component_Name\\', this.value)"></td>';
-            html += '<td class="py-1 px-1 border-r"><input type="text" class="font-mono text-xs" value="' + (r.Dwg_View || '') + '" onchange="window.updateRowData(\\'' + r._id + '\\', \\'Dwg_View\\', this.value)"></td>';
+            html += '<td class="py-1 px-1 border-r"><div class="flex items-center gap-1"><input type="text" class="font-mono text-xs" value="' + (r.Dwg_View || '') + '" onchange="window.updateRowData(\\'' + r._id + '\\', \\'Dwg_View\\', this.value)"><button class="text-orange-600 hover:text-orange-800 text-xs flex-shrink-0" title="Show on image" onclick="window.highlightRowCell(\\'' + r._id + '\\')">📍</button></div></td>';
             html += '<td class="py-1 px-1 border-r"><input type="text" value="' + (r.Pt_No || '') + '" onchange="window.updateRowData(\\'' + r._id + '\\', \\'Pt_No\\', this.value)"></td>';
             html += '<td class="py-1 px-1 border-r"><input type="text" class="font-bold text-indigo-700" value="' + (r.Dim_Type || '') + '" onchange="window.updateRowData(\\'' + r._id + '\\', \\'Dim_Type\\', this.value)"></td>';
             html += '<td class="py-1 px-1 border-r"><input type="text" value="' + (r.Dim_Description || '') + '" onchange="window.updateRowData(\\'' + r._id + '\\', \\'Dim_Description\\', this.value)"></td>';
@@ -807,11 +825,32 @@ window.onload = function() {
             tbody.appendChild(tr);
             });
         });
+        if (window.APP_STATE.images.length > 0) { window.renderGridOverlay(); }
     };
 
     window.GRID_ROWS = ['A','B','C','D','E','F','G','H'];
     window.GRID_COLS = 12;
     window.gridOverlayOn = true;
+
+    window.parseGridRef = function(ref) {
+        if (!ref) return null;
+        var m = /([A-Ha-h])\s*-?\s*(\d{1,2})/.exec(ref);
+        if (!m) return null;
+        var rowIdx = window.GRID_ROWS.indexOf(m[1].toUpperCase());
+        var colIdx = window.GRID_COLS - parseInt(m[2], 10);
+        if (rowIdx < 0 || colIdx < 0 || colIdx >= window.GRID_COLS) return null;
+        return { rowIdx: rowIdx, colIdx: colIdx };
+    };
+
+    window.cellGeometry = function(rowIdx, colIdx) {
+        var imgObj = window.APP_STATE.images[window.APP_STATE.currentIndex];
+        var imgW = imgObj._pxWidth, imgH = imgObj._pxHeight;
+        if (!imgW || !imgH) return null;
+        var left = window.imgOffsetX, top = window.imgOffsetY;
+        var w = imgW * window.fabricScaleRatio, h = imgH * window.fabricScaleRatio;
+        var colStep = w / window.GRID_COLS, rowStep = h / window.GRID_ROWS.length;
+        return { x: left + colIdx * colStep, y: top + rowIdx * rowStep, w: colStep, h: rowStep };
+    };
 
     window.renderGridOverlay = function() {
         Object.keys(window.canvasRects).forEach(function(key) {
@@ -830,6 +869,49 @@ window.onload = function() {
         var colStep = w / window.GRID_COLS;
         var rowStep = h / window.GRID_ROWS.length;
 
+        // Shade cells that already have at least one extracted row - gives an
+        // at-a-glance coverage map so gaps (unshaded areas with real content) stand out.
+        var currentImg = imgObj.name;
+        var cellItems = {};
+        window.APP_STATE.extractedData.forEach(function(r) {
+            if (r.image_name !== currentImg) return;
+            var cell = window.parseGridRef(r.Dwg_View);
+            if (!cell) return;
+            var key = cell.rowIdx + '_' + cell.colIdx;
+            if (!cellItems[key]) cellItems[key] = [];
+            cellItems[key].push(r);
+        });
+
+        var MARKER_COLORS = { dimension: '#4f46e5', component: '#d97706', title_block: '#e11d48' };
+
+        Object.keys(cellItems).forEach(function(key) {
+            var parts = key.split('_');
+            var ri = parseInt(parts[0], 10), ci = parseInt(parts[1], 10);
+            var items = cellItems[key];
+            var cols = Math.min(4, Math.ceil(Math.sqrt(items.length)));
+            var rows = Math.ceil(items.length / cols);
+            var padX = colStep / (cols + 1), padY = rowStep / (rows + 1);
+
+            items.forEach(function(r, idx) {
+                var gc = idx % cols, gr = Math.floor(idx / cols);
+                var mx = left + ci * colStep + padX * (gc + 1);
+                var my = top + ri * rowStep + padY * (gr + 1);
+                var color = MARKER_COLORS[r.Category] || '#6b7280';
+
+                var dot = new fabric.Circle({
+                    left: mx, top: my, radius: 4, originX: 'center', originY: 'center',
+                    fill: r.is_correct ? '#16a34a' : color, stroke: 'white', strokeWidth: 1,
+                    selectable: false, evented: true, hoverCursor: 'pointer'
+                });
+                dot.on('mousedown', function() { window.selectRowFromMarker(r._id); });
+                dot.on('mouseover', function() { window.showMarkerTooltip(r, mx, my); });
+                dot.on('mouseout', function() { window.hideMarkerTooltip(); });
+
+                canvas.add(dot);
+                window.canvasRects['marker_' + r._id] = dot;
+            });
+        });
+
         for (var c = 1; c < window.GRID_COLS; c++) {
             var x = left + c * colStep;
             var line = new fabric.Line([x, top, x, top + h], { stroke: 'rgba(220,38,38,0.35)', strokeWidth: 1, selectable: false, evented: false });
@@ -841,16 +923,16 @@ window.onload = function() {
             canvas.add(line); window.canvasRects['row_' + rIdx] = line;
         }
         // Column numbers run high-to-low left-to-right (matches the printed border); row letters A-H top-to-bottom
-        for (var ci = 0; ci < window.GRID_COLS; ci++) {
-            var label = window.GRID_COLS - ci;
-            var lx = left + ci * colStep + colStep / 2;
+        for (var ci2 = 0; ci2 < window.GRID_COLS; ci2++) {
+            var label = window.GRID_COLS - ci2;
+            var lx = left + ci2 * colStep + colStep / 2;
             var t1 = new fabric.Text(String(label), { left: lx, top: top - 14, fontSize: 11, fill: 'rgba(185,28,28,0.7)', selectable: false, evented: false, originX: 'center' });
-            canvas.add(t1); window.canvasRects['colLabel_' + ci] = t1;
+            canvas.add(t1); window.canvasRects['colLabel_' + ci2] = t1;
         }
-        for (var ri = 0; ri < window.GRID_ROWS.length; ri++) {
-            var ly = top + ri * rowStep + rowStep / 2;
-            var t2 = new fabric.Text(window.GRID_ROWS[ri], { left: left - 16, top: ly - 6, fontSize: 11, fill: 'rgba(185,28,28,0.7)', selectable: false, evented: false });
-            canvas.add(t2); window.canvasRects['rowLabel_' + ri] = t2;
+        for (var ri2 = 0; ri2 < window.GRID_ROWS.length; ri2++) {
+            var ly = top + ri2 * rowStep + rowStep / 2;
+            var t2 = new fabric.Text(window.GRID_ROWS[ri2], { left: left - 16, top: ly - 6, fontSize: 11, fill: 'rgba(185,28,28,0.7)', selectable: false, evented: false });
+            canvas.add(t2); window.canvasRects['rowLabel_' + ri2] = t2;
         }
         canvas.requestRenderAll();
     };
@@ -858,6 +940,73 @@ window.onload = function() {
     window.toggleGridOverlay = function() {
         window.gridOverlayOn = !window.gridOverlayOn;
         window.renderGridOverlay();
+    };
+
+    window.highlightCell = function(dwgView) {
+        var cell = window.parseGridRef(dwgView);
+        if (!cell) { logToScreen("Can't locate '" + dwgView + "' on the grid."); return; }
+        var geo = window.cellGeometry(cell.rowIdx, cell.colIdx);
+        if (!geo) return;
+        if (window.canvasRects['flash']) canvas.remove(window.canvasRects['flash']);
+        var flash = new fabric.Rect({
+            left: geo.x, top: geo.y, width: geo.w, height: geo.h,
+            fill: 'rgba(249,115,22,0.35)', stroke: '#f97316', strokeWidth: 2,
+            selectable: false, evented: false
+        });
+        canvas.add(flash);
+        canvas.bringToFront(flash);
+        window.canvasRects['flash'] = flash;
+        canvas.requestRenderAll();
+        setTimeout(function() {
+            if (window.canvasRects['flash'] === flash) {
+                canvas.remove(flash);
+                delete window.canvasRects['flash'];
+                canvas.requestRenderAll();
+            }
+        }, 2000);
+    };
+
+    window.highlightRowCell = function(id) {
+        var row = window.APP_STATE.extractedData.find(function(r) { return r._id === id; });
+        if (row) window.highlightCell(row.Dwg_View);
+    };
+
+    window.showMarkerTooltip = function(r, x, y) {
+        window.hideMarkerTooltip();
+        var label = r.Category === 'dimension'
+            ? (r.Dim_Description || r.Dim_Type || '') + ': ' + (r.Specified || '')
+            : (r.Component_Name || r.Dim_Description || '');
+        var text = new fabric.Text(label, {
+            left: x + 8, top: y - 8, fontSize: 12, fill: 'white', backgroundColor: 'rgba(17,24,39,0.85)',
+            padding: 4, selectable: false, evented: false
+        });
+        canvas.add(text);
+        canvas.bringToFront(text);
+        window.canvasRects['tooltip'] = text;
+        canvas.requestRenderAll();
+    };
+
+    window.hideMarkerTooltip = function() {
+        if (window.canvasRects['tooltip']) {
+            canvas.remove(window.canvasRects['tooltip']);
+            delete window.canvasRects['tooltip'];
+            canvas.requestRenderAll();
+        }
+    };
+
+    window.selectRowFromMarker = function(id) {
+        var row = window.APP_STATE.extractedData.find(function(r) { return r._id === id; });
+        if (!row) return;
+        if (window.APP_STATE.categoryFilter !== 'all' && window.APP_STATE.categoryFilter !== row.Category) {
+            window.APP_STATE.categoryFilter = 'all';
+            window.renderChecklistTable();
+        }
+        var tr = document.getElementById('tr_' + id);
+        if (tr) {
+            tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            tr.classList.add('marker-flash');
+            setTimeout(function() { tr.classList.remove('marker-flash'); }, 1500);
+        }
     };
 
     window.renderImage = function() {
