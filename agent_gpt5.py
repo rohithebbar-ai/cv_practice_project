@@ -178,27 +178,9 @@ def call_llm(prompt_text: str, image_files: List[Dict[str, Any]] = None) -> str:
 
     try:
         parsed_json = response.json()
+        llm_output = parsed_json["choices"][0]["message"]["content"]
     except Exception as e:
-        logger.error("LLM Call Failed (response not JSON): " + str(e))
-        logger.error(f"RAW RESPONSE WAS: {response.text}")
-        return "[]"
-
-    # Response shape differs by model (Gemini vs GPT), and the gateway can
-    # silently substitute models under some conditions - try both shapes
-    # rather than assuming one.
-    llm_output = None
-    try:
-        llm_output = parsed_json["candidates"][0]["content"]["parts"][0]["text"]  # Gemini-shaped
-    except (KeyError, IndexError, TypeError):
-        pass
-    if llm_output is None:
-        try:
-            llm_output = parsed_json["choices"][0]["message"]["content"]  # GPT/OpenAI-shaped
-        except (KeyError, IndexError, TypeError):
-            pass
-
-    if llm_output is None:
-        logger.error("LLM Call Failed (parse): response did not match Gemini or GPT shape")
+        logger.error("LLM Call Failed (parse): " + str(e))
         logger.error(f"RAW RESPONSE WAS: {response.text}")
         return "[]"
 
@@ -443,10 +425,19 @@ def find_best_match(candidate_text: str, tokens, cell_rect, min_ratio: float = 0
 # This stage only ever answers "where", never "what". Every item is tracked
 # by its own stable UUID (item["_id"], assigned once when Stage 1's JSON is
 # first parsed) all the way through - including across recursive splits - so
-# a returned bounding box can only ever be written back onto the exact row
-# it came from. The model itself never sees or needs to preserve that UUID;
-# it only echoes back small local integers, which call_llm_for_grounding
+# a returned position can only ever be written back onto the exact row it
+# came from. The model itself never sees or needs to preserve that UUID; it
+# only echoes back small local integers, which call_llm_for_grounding
 # translates back to the real UUID in Python before anything is merged.
+#
+# POSITIONING METHOD: rather than asking the model to estimate continuous
+# pixel coordinates (a much harder ask it tends to decline or guess badly
+# on), each crop is treated as its own small grid, and the model is asked to
+# point to a (row, col) cell within that grid - the same "point to grid,
+# don't estimate pixels" principle used at Stage 1, just applied at a finer
+# resolution inside a zoomed-in crop. This is a simpler, more reliably
+# answerable question, so more items end up with a usable position instead
+# of being silently skipped.
 
 GROUNDING_CROP_SCALE = 3
 GROUNDING_UPSCALED_MAX_DIM = 1600
@@ -454,11 +445,13 @@ GROUNDING_MAX_ITEMS_PER_CALL = 12       # trigger for splitting, not a hard drop
 GROUNDING_MAX_RECURSION_DEPTH = 3       # a region needing to split more than this just stays approximate
 GROUNDING_REGION_OVERLAP = 0.08         # slight overlap between split halves so boundary items aren't missed by both
 GROUNDING_SAFETY_MAX_CALLS = 300        # runaway-loop guard only - should not bind in normal use, unlike a real business cap
+GROUNDING_SUBGRID_SIZE = 4              # each crop is divided into this many rows/cols for the model to point into
 
 def crop_cell_for_grounding(image_bytes: bytes, cell_rect):
     """Crops the given (x0,y0,x1,y1) region out of the original image and
-    upscales it. Returns (crop_jpeg_bytes, (offset_x, offset_y), scale_factor)
-    so returned crop-space coordinates can be mapped back to the original image."""
+    upscales it. Returns (crop_jpeg_bytes, (offset_x, offset_y), scale_factor).
+    The offset/scale are kept for reference, but the sub-grid positioning
+    below computes directly from cell_rect instead of needing them."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     x0, y0, x1, y1 = cell_rect
     x0, y0 = max(0, int(x0)), max(0, int(y0))
@@ -496,8 +489,10 @@ def build_grounding_prompt(local_items):
     model to transcribe a long UUID verbatim invites transcription errors."""
     lines = [
         "You are given a small cropped region of a larger engineering drawing.",
+        f"This crop is divided into a {GROUNDING_SUBGRID_SIZE}x{GROUNDING_SUBGRID_SIZE} grid: rows 1 to {GROUNDING_SUBGRID_SIZE} top to bottom, columns 1 to {GROUNDING_SUBGRID_SIZE} left to right.",
         "Below is a numbered list of values/labels known to be visible somewhere in this crop.",
-        "For each one, return its precise pixel bounding box within THIS CROPPED IMAGE ONLY.",
+        "For each one, point to which grid cell (row, column) of THIS CROP it falls in.",
+        "Do not estimate pixel coordinates - only give the row and column number of the grid cell.",
         "",
         "Items:"
     ]
@@ -506,16 +501,15 @@ def build_grounding_prompt(local_items):
     lines.append("")
     lines.append("OUTPUT FORMAT:")
     lines.append("Return ONLY a valid JSON array, no markdown, no explanation.")
-    lines.append('Each object: {"id": <the number above>, "bbox": [x, y, width, height]}')
-    lines.append("bbox must be pixel coordinates within this cropped image, where x+width <= image width and y+height <= image height.")
-    lines.append("If you cannot confidently locate an item, omit it entirely from the array - do not guess.")
+    lines.append(f'Each object: {{"id": <the number above>, "row": <1 to {GROUNDING_SUBGRID_SIZE}>, "col": <1 to {GROUNDING_SUBGRID_SIZE}>}}')
+    lines.append("If you cannot confidently locate an item in this crop, omit it entirely from the array - do not guess.")
     return "\n".join(lines)
 
 def call_llm_for_grounding(crop_bytes: bytes, items):
     """items: list of {"id": <stable UUID string>, "text": str}.
-    Returns list of {"id": <the SAME UUID string>, "bbox": [...]} - the UUID
-    round-trips through a local integer translation internally so the model
-    never has to handle it directly."""
+    Returns list of {"id": <the SAME UUID string>, "row": int, "col": int} -
+    the UUID round-trips through a local integer translation internally so
+    the model never has to handle it directly."""
     if not items or not crop_bytes:
         return []
     local_items = [{"local_id": i, "text": it["text"]} for i, it in enumerate(items)]
@@ -529,19 +523,23 @@ def call_llm_for_grounding(crop_bytes: bytes, items):
     for res in parsed:
         try:
             local_id = int(res.get("id"))
-            bbox = res.get("bbox")
+            row = int(res.get("row"))
+            col = int(res.get("col"))
         except (TypeError, ValueError, AttributeError):
             continue
-        if bbox and 0 <= local_id < len(items):
-            results.append({"id": items[local_id]["id"], "bbox": bbox})
+        if 0 <= local_id < len(items) and 1 <= row <= GROUNDING_SUBGRID_SIZE and 1 <= col <= GROUNDING_SUBGRID_SIZE:
+            results.append({"id": items[local_id]["id"], "row": row, "col": col})
     return results
 
 def ground_items_recursive(image_bytes: bytes, items, rect, depth: int, call_state: dict):
     """items: list of {"id": <stable UUID string>, "text": str}.
-    Returns dict {uuid: [x,y,w,h]} in ORIGINAL image pixel coordinates.
-    If a region has too many items for one call, splits the CROP (not the
-    item list) and recurses - each half is asked about the full remaining
-    item list, since we don't know in advance which half an item is in."""
+    Returns dict {uuid: [x,y,w,h]} in ORIGINAL image pixel coordinates - a
+    synthetic bbox sized to one sub-grid cell, computed from which (row, col)
+    the model pointed to within the crop, not from any model-estimated pixel
+    position. If a region has too many items for one call, splits the CROP
+    (not the item list) and recurses - each half is asked about the full
+    remaining item list, since we don't know in advance which half an item
+    is in."""
     if not items:
         return {}
     if call_state["calls"] >= GROUNDING_SAFETY_MAX_CALLS:
@@ -568,18 +566,23 @@ def ground_items_recursive(image_bytes: bytes, items, rect, depth: int, call_sta
         logger.warning(f"Grounding call failed at depth {depth}: {e}")
         return {}
 
-    ox, oy = offset
+    # Convert each (row, col) pointer into a synthetic bbox in ORIGINAL image
+    # pixel space, sized to one sub-grid cell. This is computed directly from
+    # rect (the exact region the crop shows), so no scale/offset math is
+    # needed - the sub-grid divides the same region the crop displays.
+    x0, y0, x1, y1 = rect
+    sub_w = (x1 - x0) / GROUNDING_SUBGRID_SIZE
+    sub_h = (y1 - y0) / GROUNDING_SUBGRID_SIZE
+
     found = {}
     valid_ids = {it["id"] for it in items}
     for res in raw_results:
-        rid, bbox = res.get("id"), res.get("bbox")
-        if rid not in valid_ids or not bbox or len(bbox) != 4:
+        rid, row, col = res.get("id"), res.get("row"), res.get("col")
+        if rid not in valid_ids or row is None or col is None:
             continue
-        try:
-            cx, cy, cw, ch = [float(v) for v in bbox]
-            found[rid] = [int(ox + cx / scale), int(oy + cy / scale), int(cw / scale), int(ch / scale)]
-        except (TypeError, ValueError, ZeroDivisionError):
-            continue
+        cell_x0 = x0 + (col - 1) * sub_w
+        cell_y0 = y0 + (row - 1) * sub_h
+        found[rid] = [int(cell_x0), int(cell_y0), int(sub_w), int(sub_h)]
     return found
 
 # ========================================================
@@ -1767,4 +1770,4 @@ async def serve_frontend():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8081)
+    uvicorn.run(app, host="0.0.0.0", port=8083)
