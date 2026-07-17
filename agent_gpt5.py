@@ -492,7 +492,11 @@ def build_grounding_prompt(local_items):
         f"This crop is divided into a {GROUNDING_SUBGRID_SIZE}x{GROUNDING_SUBGRID_SIZE} grid: rows 1 to {GROUNDING_SUBGRID_SIZE} top to bottom, columns 1 to {GROUNDING_SUBGRID_SIZE} left to right.",
         "Below is a numbered list of values/labels known to be visible somewhere in this crop.",
         "For each one, point to which grid cell (row, column) of THIS CROP it falls in.",
-        "Do not estimate pixel coordinates - only give the row and column number of the grid cell.",
+        "Do NOT output pixel coordinates, x, y, width, height, or any kind of",
+        "bounding box in any form. The ONLY location information allowed is the",
+        "row number and column number of the grid cell - two small integers,",
+        "nothing else. If you find yourself estimating a pixel position, stop",
+        "and instead just pick the single grid cell that position falls within.",
         "",
         "Items:"
     ]
@@ -533,13 +537,14 @@ def call_llm_for_grounding(crop_bytes: bytes, items):
 
 def ground_items_recursive(image_bytes: bytes, items, rect, depth: int, call_state: dict):
     """items: list of {"id": <stable UUID string>, "text": str}.
-    Returns dict {uuid: [x,y,w,h]} in ORIGINAL image pixel coordinates - a
-    synthetic bbox sized to one sub-grid cell, computed from which (row, col)
-    the model pointed to within the crop, not from any model-estimated pixel
-    position. If a region has too many items for one call, splits the CROP
-    (not the item list) and recurses - each half is asked about the full
-    remaining item list, since we don't know in advance which half an item
-    is in."""
+    Returns dict {uuid: {"rect": [x0,y0,x1,y1], "row": r, "col": c, "grid_size": N}}
+    - a plain grid pointer, not a bbox. No pixel coordinate is ever fabricated
+    here; "rect" is just the region that was asked about (needed so the
+    frontend can compute an on-screen position from the pointer at render
+    time), and row/col are exactly what the model answered. If a region has
+    too many items for one call, splits the CROP (not the item list) and
+    recurses - each half is asked about the full remaining item list, since
+    we don't know in advance which half an item is in."""
     if not items:
         return {}
     if call_state["calls"] >= GROUNDING_SAFETY_MAX_CALLS:
@@ -566,23 +571,14 @@ def ground_items_recursive(image_bytes: bytes, items, rect, depth: int, call_sta
         logger.warning(f"Grounding call failed at depth {depth}: {e}")
         return {}
 
-    # Convert each (row, col) pointer into a synthetic bbox in ORIGINAL image
-    # pixel space, sized to one sub-grid cell. This is computed directly from
-    # rect (the exact region the crop shows), so no scale/offset math is
-    # needed - the sub-grid divides the same region the crop displays.
     x0, y0, x1, y1 = rect
-    sub_w = (x1 - x0) / GROUNDING_SUBGRID_SIZE
-    sub_h = (y1 - y0) / GROUNDING_SUBGRID_SIZE
-
     found = {}
     valid_ids = {it["id"] for it in items}
     for res in raw_results:
         rid, row, col = res.get("id"), res.get("row"), res.get("col")
         if rid not in valid_ids or row is None or col is None:
             continue
-        cell_x0 = x0 + (col - 1) * sub_w
-        cell_y0 = y0 + (row - 1) * sub_h
-        found[rid] = [int(cell_x0), int(cell_y0), int(sub_w), int(sub_h)]
+        found[rid] = {"rect": [x0, y0, x1, y1], "row": row, "col": col, "grid_size": GROUNDING_SUBGRID_SIZE}
     return found
 
 # ========================================================
@@ -870,7 +866,8 @@ async def extract_data(payload: ExtractRequest):
                 "Category": "",
                 "Component_Name": "",
                 "Quantity": "",
-                "matched_bbox": None
+                "matched_bbox": None,
+                "grid_pointer": None
             }]
 
         # Authoritatively set image_name ourselves - we know exactly which
@@ -895,6 +892,7 @@ async def extract_data(payload: ExtractRequest):
         img_name = item.get("image_name")
         img_bytes = image_bytes_by_name.get(img_name)
         item["matched_bbox"] = None
+        item["grid_pointer"] = None
         if not img_bytes:
             continue
 
@@ -967,12 +965,12 @@ async def extract_data(payload: ExtractRequest):
             )
 
             found = ground_items_recursive(img_bytes, candidate_items, rect, 0, grounding_call_state)
-            for gid, bbox in found.items():
+            for gid, pointer in found.items():
                 target = items_by_id.get(gid)
                 if not target:
                     continue
-                target["matched_bbox"] = bbox
-                target["match_source"] = "llm_grounding"
+                target["grid_pointer"] = pointer
+                target["match_source"] = "llm_grid_pointer"
                 llm_grounding_matched_count += 1
 
     llm_grounding_calls_made = grounding_call_state["calls"]
@@ -1491,9 +1489,21 @@ window.onload = function() {
             items.forEach(function(r, idx) {
                 var mx, my, isPrecise;
                 if (r.matched_bbox && r.matched_bbox.length === 4) {
+                    // OCR - a real detected pixel position
                     var bx = r.matched_bbox[0], by = r.matched_bbox[1], bw = r.matched_bbox[2], bh = r.matched_bbox[3];
                     mx = window.imgOffsetX + (bx + bw / 2) * window.fabricScaleRatio;
                     my = window.imgOffsetY + (by + bh / 2) * window.fabricScaleRatio;
+                    isPrecise = true;
+                } else if (r.grid_pointer) {
+                    // AI grid pointer - just a (row, col) answer, no pixel/bbox involved.
+                    // Position is computed here, at render time, purely from that grid reference.
+                    var gp = r.grid_pointer;
+                    var gx0 = gp.rect[0], gy0 = gp.rect[1], gx1 = gp.rect[2], gy1 = gp.rect[3];
+                    var subW = (gx1 - gx0) / gp.grid_size, subH = (gy1 - gy0) / gp.grid_size;
+                    var cellCx = gx0 + (gp.col - 1) * subW + subW / 2;
+                    var cellCy = gy0 + (gp.row - 1) * subH + subH / 2;
+                    mx = window.imgOffsetX + cellCx * window.fabricScaleRatio;
+                    my = window.imgOffsetY + cellCy * window.fabricScaleRatio;
                     isPrecise = true;
                 } else {
                     var gc = idx % cols, gr = Math.floor(idx / cols);
@@ -1703,7 +1713,7 @@ window.onload = function() {
                     logToScreen("OCR matched " + s.ocr_matched_count + " of " + s.total_count + " rows.");
                 }
                 if (s.llm_grounding_calls > 0) {
-                    logToScreen("AI grounding pass: " + s.llm_grounding_calls + " cell call(s), recovered " + s.llm_grounding_matched_count + " more precise positions.");
+                    logToScreen("AI grid-pointer pass: " + s.llm_grounding_calls + " cell call(s), recovered " + s.llm_grounding_matched_count + " more grid-cell positions.");
                 }
                 var stillApprox = s.total_count - s.ocr_matched_count - s.llm_grounding_matched_count;
                 logToScreen(stillApprox + " row(s) remain approximate (dashed).");
@@ -1770,4 +1780,4 @@ async def serve_frontend():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8083)
+    uvicorn.run(app, host="0.0.0.0", port=8084)
